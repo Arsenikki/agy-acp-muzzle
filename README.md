@@ -8,8 +8,9 @@ allowed. `agy-acp-muzzle` wraps Google's official Antigravity ACP kernel with:
 - visible denials;
 - history that survives restarts.
 
-> **Status: pre-alpha.** The transparent relay works. Lockdown and sandboxing
-> are designed (see [docs/DESIGN.md](docs/DESIGN.md)) but not implemented yet.
+> **Status: pre-alpha.** The relay and the locked-mode policy are implemented
+> and tested against a fake kernel; Landlock and runtime tests against the real
+> kernel are next (see [docs/DESIGN.md](docs/DESIGN.md)).
 
 ## How it works
 
@@ -35,7 +36,14 @@ yourself under the [Antigravity terms](https://antigravity.google/terms).
 ```bash
 go build -o agy-acp-muzzle ./cmd/agy-acp-muzzle
 AGY_ACP_MUZZLE_KERNEL=/opt/agy-acp-server/agy_acp_server.par ./agy-acp-muzzle
+
+# locked session for untrusted input (or set AGY_LOCKDOWN=1)
+./agy-acp-muzzle --locked
 ```
+
+Locked mode needs the kernel to be logged in once (its credentials live in
+`$GEMINI_HOME/antigravity-acp/acp_token.json`); each locked connection gets a
+private temporary Gemini home holding only that file.
 
 As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
 

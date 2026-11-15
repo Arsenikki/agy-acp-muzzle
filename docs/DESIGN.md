@@ -135,9 +135,9 @@ On the same daemon, an open session must keep full tools.
 
 ## Roadmap
 
-1. Transparent relay (this skeleton) and a runtime spike: history across
-   restarts, resume, memory.
-2. Locked-mode policy filters plus unit tests.
+1. ~~Transparent relay~~ (done). Runtime spike: history across restarts,
+   resume, memory.
+2. ~~Locked-mode policy filters~~ (done; tested against a fake kernel).
 3. Landlock for the kernel child.
 4. Port the acceptance test; package for container images (pinned kernel and
    checksum).
