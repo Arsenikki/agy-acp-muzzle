@@ -209,6 +209,9 @@ func TestLockedEndToEnd(t *testing.T) {
 
 	_, sbErr := sandbox.Check()
 	if sbErr != nil {
+		if os.Getenv("AGY_ACP_MUZZLE_REQUIRE_LANDLOCK") == "1" {
+			t.Fatalf("landlock required but unavailable: %v", sbErr)
+		}
 		t.Logf("landlock unavailable, testing the policy without it: %v", sbErr)
 	}
 	c := startServe(t, options{locked: true, tmpBase: tmpBase, srcHome: src, sandbox: sandboxConfig{disabled: sbErr != nil}})

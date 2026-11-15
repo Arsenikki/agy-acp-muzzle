@@ -118,6 +118,9 @@ func listen(t *testing.T) (string, uint16) {
 
 func TestExecConfines(t *testing.T) {
 	if _, err := Check(); err != nil {
+		if os.Getenv("AGY_ACP_MUZZLE_REQUIRE_LANDLOCK") == "1" {
+			t.Fatalf("landlock required but unavailable: %v", err)
+		}
 		t.Skipf("landlock unavailable: %v", err)
 	}
 	exe, err := os.Executable()
