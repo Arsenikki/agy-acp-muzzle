@@ -1,0 +1,144 @@
+# agy-acp-muzzle — design
+
+Status: **draft**. Kernel facts below come from reading the sources of the
+official `agy_acp_server` 1.4.5 Linux x86_64 build (archive SHA-256
+`923923a0d7dc8073f66cc6f78647a3107e3a7ee2b7e1a24df8b3927b5188013b`) and from
+the Paseo 0.15.4 server sources. Items marked *(verify)* have not been
+exercised at runtime yet.
+
+## Problem
+
+Headless Antigravity is "full auto" by default. Paseo's built-in Antigravity
+provider drives the `agy` CLI with a fixed command line:
+
+```
+agy --input-format stream-json --output-format stream-json --add-dir <cwd> \
+    --disable-slash-commands --dangerously-skip-permissions --model <m> [--conversation <id>]
+```
+
+`--dangerously-skip-permissions` is hard-coded, so every tool call, including
+shell commands, file access outside the workspace and network fetches, runs
+without asking. That is the wrong default for agents fed untrusted input (for
+example a scheduled job summarising email) and gives a shared daemon no way to
+lock down one session while others keep their tools.
+
+There are further gaps compared with providers such as Claude Code:
+
+- **History after restarts.** The built-in provider has no history replay;
+  after a daemon restart the client shows only repeated "running with full
+  access" notices, although the conversation is still on disk.
+- **No real permission modes.** Only full access.
+- **One MCP registry per home.** It is shared by every agent on a daemon.
+- **No watchdog.** A hung turn stays `running` indefinitely.
+
+## Approach
+
+Speak ACP (Agent Client Protocol, JSON-RPC 2.0 over NDJSON on stdio) to
+Google's official headless kernel, `agy_acp_server`, unmodified, and put a
+small Go process between it and the client:
+
+```
+ACP client (Paseo, Zed, ...)  <-- ACP -->  agy-acp-muzzle  <-- ACP -->  agy_acp_server (unmodified)
+                                           policy | rewrite | sandbox
+```
+
+The muzzle starts the kernel as its child. It applies Landlock to that child
+before exec, and relays messages through two filters (client→kernel and
+kernel→client). Each filter can forward, rewrite, drop or answer a message.
+The kernel is never patched; it is installed and authenticated separately and
+remains under Google's terms.
+
+The relay is client-agnostic. Anything client-specific (e.g. Paseo's mode ids)
+lives in an optional profile.
+
+## What the kernel already provides
+
+From the 1.4.5 sources:
+
+| Feature | Detail |
+|---|---|
+| History replay | Advertises `loadSession` and session `list`/`resume`. `session/load` restores the session and streams every stored step back as `session/update`. Paseo's generic ACP provider replays history through `session/load` when `loadSession` is advertised. |
+| Per-session tool filter | `_meta.antigravity.enabledTools` (allowlist) / `disabledTools` (denylist) on `session/new`, `session/load` and `session/resume`. **`enabledTools: []` disables every built-in.** The filter does not cover MCP tools. |
+| Built-in tools | 15: `list_directory`, `search_directory`, `find_file`, `view_file`, `create_file`, `edit_file`, `run_command`, `ask_question`, `invoke_subagent`, `run_workflow`, `generate_image`, `search_web`, `read_url_content`, `schedule`, `finish`. |
+| Permissions | Asks the client via `session/request_permission` with `allow_once` / `reject_once` options. Modes: `default`, `auto_edit`, `yolo`. |
+| Client filesystem | Uses the client's `fs/read_text_file` / `fs/write_text_file` when the client advertises them in `initialize`. |
+| MCP | Session `mcpServers` over http/sse, **merged with `$GEMINI_HOME/config/mcp_config.json`**, which is always loaded. |
+| State | Everything under `$GEMINI_HOME` (default `~/.gemini`); this server's credentials and conversations live under `antigravity-acp/`. |
+| OS sandbox | Its own terminal sandbox ("exebox") only engages via business-account admin controls, so it is not usable with personal accounts. |
+| Structured output | None. |
+
+## Modes
+
+The client selects the mode per session. With Paseo the selector is the launch
+environment: Paseo starts one ACP process per agent and overlays the run's
+`--env` on it, so `paseo run --env AGY_LOCKDOWN=1 ...` reaches the muzzle
+*(verify)*. Other clients can use the provider's environment configuration.
+
+### open (default)
+
+Transparent relay with these additions:
+
+- a turn watchdog (fail the turn after a configurable timeout);
+- an empty-turn guard (an `end_turn` with no output becomes an error);
+- mode mapping for the client profile;
+- an optional concurrency cap per account.
+
+### locked
+
+For untrusted input. The requirements and how each is met:
+
+| # | Requirement | Mechanism |
+|---|---|---|
+| 1 | No tools, selected per session | Inject `_meta.antigravity.enabledTools: []` into `session/new`, `session/load` and `session/resume`; client-supplied tool filters are overridden. |
+| 2 | No auto-approval | Answer every `session/request_permission` from the kernel with `reject_once` inside the muzzle; never forward it, so client-side auto-accept cannot approve. Refuse `session/set_mode` to `yolo`. |
+| 3 | Structured output | Client side for now: `paseo run --output-schema` is provider-agnostic (prompted schema, validation, 2 retries, `OUTPUT_SCHEMA_FAILED`). A native option for other clients is future work. |
+| 4 | Visible denials | Record each rejected permission, report it to the client and end the turn as failed instead of success-with-empty-response. |
+| 5 | Session isolation | Replace `cwd` with a fresh empty temp directory (removed on exit); strip `mcpServers`; run the kernel with a temp `GEMINI_HOME` containing only the credentials *(verify what startup needs)*; strip `clientCapabilities.fs` from `initialize`. |
+| 6 | Env passthrough | The launch env is passed to the kernel unchanged. |
+
+**Landlock** (Linux ≥ 5.13; network rules need ABI ≥ 4) is applied to the
+kernel process in locked mode as a second layer:
+
+- **execute:** only the kernel's own install directory;
+- **filesystem:** read/write only in the temp `GEMINI_HOME` and the temp
+  workspace, read-only for system libraries;
+- **network:** TCP connect to port 443 only.
+
+Limits: Landlock filters ports, not hostnames, and `search_web` grounding runs
+server-side at Google, so it cannot be blocked locally (it is a built-in here,
+so `enabledTools: []` should remove it *(verify)*).
+
+### Acceptance (locked)
+
+These checks are ported from an existing CLI lockdown test. A locked session
+must:
+
+1. not return a random secret planted outside its workspace;
+2. not reach a local HTTP listener;
+3. not write any file;
+4. still answer a plain prompt;
+5. report attempted tool use as a failure.
+
+On the same daemon, an open session must keep full tools.
+
+## Open questions
+
+- **Startup:** the minimum `GEMINI_HOME` contents for an authenticated
+  kernel start.
+- **Memory:** use per kernel process (one per agent).
+- **Subagents:** whether `invoke_subagent` and the browser subagent honour the
+  session tool filter.
+- **Exec allowlist:** which executables the kernel spawns internally (the
+  Landlock allowlist must match).
+- **Paseo env:** whether the Paseo `--env` overlay reaches custom ACP
+  providers in every daemon version we care about.
+
+## Roadmap
+
+1. Transparent relay (this skeleton) and a runtime spike: history across
+   restarts, resume, memory.
+2. Locked-mode policy filters plus unit tests.
+3. Landlock for the kernel child.
+4. Port the acceptance test; package for container images (pinned kernel and
+   checksum).
+5. Open-mode extras: watchdog, empty-turn guard, concurrency cap.
