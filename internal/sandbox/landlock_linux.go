@@ -151,8 +151,26 @@ func buildRuleset(abi int, rules Rules) (int, error) {
 			}
 		}
 	}
-	for _, port := range rules.ConnectTCP {
-		if err := addPort(fd, port); err != nil {
+	ports := append([]uint16{}, rules.ConnectTCP...)
+	for _, r := range rules.ConnectTCPRanges {
+		if r.Lo == 0 || r.Hi < r.Lo {
+			syscall.Close(fd)
+			return -1, fmt.Errorf("sandbox: bad port range %d-%d", r.Lo, r.Hi)
+		}
+		for p := uint32(r.Lo); p <= uint32(r.Hi); p++ {
+			ports = append(ports, uint16(p))
+		}
+	}
+	for _, port := range ports {
+		if err := addPort(fd, port, netConnectTCP); err != nil {
+			syscall.Close(fd)
+			return -1, err
+		}
+	}
+	if rules.BindEphemeral {
+		// A bind rule for port 0 matches only binds that let the kernel
+		// pick an ephemeral port.
+		if err := addPort(fd, 0, netBindTCP); err != nil {
 			syscall.Close(fd)
 			return -1, err
 		}
@@ -190,10 +208,10 @@ func addPath(rulesetFD int, path string, access uint64) error {
 	return nil
 }
 
-func addPort(rulesetFD int, port uint16) error {
+func addPort(rulesetFD int, port uint16, access uint64) error {
 	// struct landlock_net_port_attr: u64 allowed_access, u64 port.
 	attr := make([]byte, 16)
-	binary.NativeEndian.PutUint64(attr[0:], netConnectTCP)
+	binary.NativeEndian.PutUint64(attr[0:], access)
 	binary.NativeEndian.PutUint64(attr[8:], uint64(port))
 	_, _, errno := syscall.Syscall6(sysLandlockAddRule, uintptr(rulesetFD), ruleTypeNetPort,
 		uintptr(unsafe.Pointer(&attr[0])), 0, 0, 0)

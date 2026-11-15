@@ -82,6 +82,12 @@ func runAction(a string) error {
 			c.Close()
 		}
 		return err
+	case "listen":
+		l, err := net.Listen("tcp", arg)
+		if err == nil {
+			l.Close()
+		}
+		return err
 	}
 	return fmt.Errorf("unknown action %q", a)
 }
@@ -139,12 +145,15 @@ func TestExecConfines(t *testing.T) {
 	}
 	allowedAddr, allowedPort := listen(t)
 	deniedAddr, _ := listen(t)
+	rangeAddr, rangePort := listen(t)
 
 	rules := Rules{
-		Exec:       []string{exe},
-		ReadOnly:   []string{ro, "/proc/self", "/etc"},
-		ReadWrite:  []string{rw, "/dev/null"},
-		ConnectTCP: []uint16{allowedPort},
+		Exec:             []string{exe},
+		ReadOnly:         []string{ro, "/proc/self", "/etc"},
+		ReadWrite:        []string{rw, "/dev/null"},
+		ConnectTCP:       []uint16{allowedPort},
+		ConnectTCPRanges: []PortRange{{Lo: rangePort, Hi: rangePort}},
+		BindEphemeral:    true,
 	}
 	if interp, err := Interpreter(exe); err != nil {
 		t.Fatal(err)
@@ -164,6 +173,9 @@ func TestExecConfines(t *testing.T) {
 		"exec:/usr/bin/env":                        false,
 		"connect:" + allowedAddr:                   true,
 		"connect:" + deniedAddr:                    false,
+		"connect:" + rangeAddr:                     true,
+		"listen:127.0.0.1:0":                       true,
+		"listen:127.0.0.1:18081":                   false,
 	}
 	var actions []string
 	for a := range want {
