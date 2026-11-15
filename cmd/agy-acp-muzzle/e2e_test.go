@@ -1,0 +1,269 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Arsenikki/agy-acp-muzzle/internal/policy"
+)
+
+// fakeKernelEnv makes the test binary act as a minimal ACP kernel.
+const fakeKernelEnv = "AGY_ACP_MUZZLE_FAKE_KERNEL"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(fakeKernelEnv) == "1" {
+		os.Exit(fakeKernel(os.Stdin, os.Stdout))
+	}
+	os.Exit(m.Run())
+}
+
+// fakeKernel answers initialize and session/new by echoing what it received
+// (plus its environment), and on session/prompt asks permission for a shell
+// command, reports the answer it got in a session/update, then ends the turn.
+func fakeKernel(in io.Reader, out io.Writer) int {
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(out, "%s\n", b)
+	}
+	for sc.Scan() {
+		var msg struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params map[string]any  `json:"params"`
+		}
+		if json.Unmarshal(sc.Bytes(), &msg) != nil {
+			continue
+		}
+		reply := func(result any) {
+			send(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": result})
+		}
+		switch msg.Method {
+		case "initialize":
+			wd, _ := os.Getwd()
+			reply(map[string]any{
+				"echo":       msg.Params,
+				"geminiHome": os.Getenv("GEMINI_HOME"),
+				"forceFile":  os.Getenv("AGY_ACP_FORCE_FILE_STORAGE"),
+				"kernelCwd":  wd,
+			})
+		case "session/new":
+			reply(map[string]any{"sessionId": "s1", "modes": map[string]any{"currentModeId": "default"}, "echo": msg.Params})
+		case "session/prompt":
+			send(map[string]any{"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": map[string]any{
+				"sessionId": "s1",
+				"toolCall":  map[string]any{"toolCallId": "t1", "title": "cat /etc/passwd", "kind": "execute"},
+				"options": []any{
+					map[string]any{"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+					map[string]any{"optionId": "deny", "name": "Deny", "kind": "reject_once"},
+				},
+			}})
+			if !sc.Scan() {
+				return 1
+			}
+			var answer any
+			_ = json.Unmarshal(sc.Bytes(), &answer)
+			send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
+				"sessionId": "s1", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "permissionAnswer": answer},
+			}})
+			reply(map[string]any{"stopReason": "end_turn"})
+		default:
+			reply(map[string]any{})
+		}
+	}
+	return 0
+}
+
+// client drives serve over pipes.
+type client struct {
+	t    *testing.T
+	in   *io.PipeWriter
+	out  *bufio.Scanner
+	done chan int
+}
+
+func startServe(t *testing.T, o options) *client {
+	t.Helper()
+	t.Setenv(fakeKernelEnv, "1")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	o.argv = []string{exe}
+	o.stdin, o.stdout = inR, outW
+	c := &client{t: t, in: inW, out: bufio.NewScanner(outR), done: make(chan int, 1)}
+	c.out.Buffer(make([]byte, 1<<20), 1<<20)
+	go func() {
+		code, err := serve(slog.New(slog.NewTextHandler(io.Discard, nil)), o)
+		if err != nil {
+			t.Errorf("serve: %v", err)
+		}
+		_ = outW.Close()
+		c.done <- code
+	}()
+	return c
+}
+
+func (c *client) send(line string) {
+	c.t.Helper()
+	if _, err := io.WriteString(c.in, line+"\n"); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+func (c *client) next() map[string]any {
+	c.t.Helper()
+	got := make(chan bool, 1)
+	go func() { got <- c.out.Scan() }()
+	select {
+	case ok := <-got:
+		if !ok {
+			c.t.Fatalf("muzzle output ended: %v", c.out.Err())
+		}
+	case <-time.After(10 * time.Second):
+		c.t.Fatal("timed out waiting for the muzzle")
+	}
+	var m map[string]any
+	if err := json.Unmarshal(c.out.Bytes(), &m); err != nil {
+		c.t.Fatalf("bad line %q: %v", c.out.Bytes(), err)
+	}
+	return m
+}
+
+func (c *client) close() int {
+	c.t.Helper()
+	_ = c.in.Close()
+	select {
+	case code := <-c.done:
+		return code
+	case <-time.After(10 * time.Second):
+		c.t.Fatal("muzzle did not exit")
+		return -1
+	}
+}
+
+const (
+	initLine   = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":true}}}`
+	newLine    = `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/home/user/project","mcpServers":[{"name":"m","type":"http","url":"http://m"}]}}`
+	promptLine = `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"hi"}]}}`
+)
+
+func TestLockedEndToEnd(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, consumerTokenRel), `{"refresh_token":"x"}`)
+	writeFile(t, filepath.Join(src, "config", "mcp_config.json"), `{}`)
+	tmpBase := t.TempDir()
+
+	c := startServe(t, options{locked: true, tmpBase: tmpBase, srcHome: src})
+
+	c.send(initLine)
+	init := c.next()
+	if path(init, "result", "echo", "clientCapabilities", "fs") != nil || path(init, "result", "echo", "clientCapabilities", "terminal") != nil {
+		t.Errorf("client IO capabilities reached the kernel: %v", init)
+	}
+	home, _ := path(init, "result", "geminiHome").(string)
+	if home == "" || home == src || !strings.HasPrefix(home, tmpBase) {
+		t.Errorf("kernel GEMINI_HOME = %q", home)
+	}
+	if path(init, "result", "forceFile") != "1" {
+		t.Errorf("file storage not forced: %v", init)
+	}
+	if _, err := os.Stat(filepath.Join(home, consumerTokenRel)); err != nil {
+		t.Errorf("credentials missing in kernel home: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "config", "mcp_config.json")); !os.IsNotExist(err) {
+		t.Errorf("global MCP config leaked into kernel home: %v", err)
+	}
+
+	c.send(newLine)
+	sess := c.next()
+	cwd, _ := path(sess, "result", "echo", "cwd").(string)
+	if cwd == "/home/user/project" || !strings.HasPrefix(cwd, tmpBase) {
+		t.Errorf("session cwd = %q", cwd)
+	}
+	if mcp, _ := path(sess, "result", "echo", "mcpServers").([]any); len(mcp) != 0 {
+		t.Errorf("mcpServers reached the kernel: %v", mcp)
+	}
+	if tools, ok := path(sess, "result", "echo", "_meta", "antigravity", "enabledTools").([]any); !ok || len(tools) != 0 {
+		t.Errorf("enabledTools = %v", path(sess, "result", "echo", "_meta"))
+	}
+
+	// The permission request never reaches the client; the kernel gets a
+	// rejection and the turn fails with the denial listed.
+	c.send(promptLine)
+	update := c.next()
+	if update["method"] != "session/update" {
+		t.Fatalf("client saw %v before the turn ended", update)
+	}
+	if got := path(update, "params", "update", "permissionAnswer", "result", "outcome", "optionId"); got != "deny" {
+		t.Errorf("kernel got permission answer %v", got)
+	}
+	resp := c.next()
+	if path(resp, "error", "code") != float64(policy.CodeDenied) {
+		t.Fatalf("prompt response = %v", resp)
+	}
+
+	if code := c.close(); code != 0 {
+		t.Errorf("exit code %d", code)
+	}
+	if entries, _ := os.ReadDir(tmpBase); len(entries) != 0 {
+		t.Errorf("locked directories left behind: %d", len(entries))
+	}
+}
+
+func TestOpenEndToEnd(t *testing.T) {
+	c := startServe(t, options{})
+
+	c.send(initLine)
+	init := c.next()
+	if path(init, "result", "echo", "clientCapabilities", "fs") == nil {
+		t.Errorf("open mode stripped fs: %v", init)
+	}
+
+	c.send(newLine)
+	sess := c.next()
+	if path(sess, "result", "echo", "cwd") != "/home/user/project" {
+		t.Errorf("open mode rewrote cwd: %v", sess)
+	}
+
+	// The permission request goes to the client, which approves it.
+	c.send(promptLine)
+	req := c.next()
+	if req["method"] != "session/request_permission" {
+		t.Fatalf("want permission request, got %v", req)
+	}
+	c.send(`{"jsonrpc":"2.0","id":"perm-1","result":{"outcome":{"outcome":"selected","optionId":"allow"}}}`)
+	update := c.next()
+	if got := path(update, "params", "update", "permissionAnswer", "result", "outcome", "optionId"); got != "allow" {
+		t.Errorf("kernel got %v", got)
+	}
+	if resp := c.next(); path(resp, "result", "stopReason") != "end_turn" {
+		t.Errorf("prompt response = %v", resp)
+	}
+	if code := c.close(); code != 0 {
+		t.Errorf("exit code %d", code)
+	}
+}
+
+func path(m map[string]any, keys ...string) any {
+	var cur any = m
+	for _, k := range keys {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = obj[k]
+	}
+	return cur
+}
