@@ -73,6 +73,14 @@ As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
 go vet ./... && go test ./...
 ```
 
+`cmd/acp-smoke` is a scripted ACP client for manual runs against the real
+kernel:
+
+```bash
+go build -o acp-smoke ./cmd/acp-smoke
+./acp-smoke -prompt "Reply with PONG" -- ./agy-acp-muzzle --locked
+```
+
 ## License
 
 Apache-2.0. Community project, not affiliated with Google or Paseo.
