@@ -19,5 +19,9 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
-      - run: go test -race ./...
+      - name: go test
+        run: go test -race ./...
+        env:
+          # Fail instead of skipping the Landlock tests if the runner lacks it.
+          AGY_ACP_MUZZLE_REQUIRE_LANDLOCK: "1"
       - run: CGO_ENABLED=0 go build -trimpath ./cmd/agy-acp-muzzle

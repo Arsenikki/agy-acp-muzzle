@@ -71,9 +71,14 @@ func TestPrepareLockedFailsClosedWithoutCredentials(t *testing.T) {
 }
 
 func TestKernelEnv(t *testing.T) {
-	e := &lockedEnv{Home: "/t/gemini"}
-	got := e.KernelEnv([]string{"PATH=/bin", "GEMINI_HOME=/real", "AGY_ACP_FORCE_FILE_STORAGE=0", "X=1"})
-	want := []string{"PATH=/bin", "X=1", "GEMINI_HOME=/t/gemini", "AGY_ACP_FORCE_FILE_STORAGE=1"}
+	e := &lockedEnv{root: "/t", Home: "/t/gemini"}
+	got := e.KernelEnv([]string{"PATH=/bin", "HOME=/home/u", "GEMINI_HOME=/real", "AGY_ACP_FORCE_FILE_STORAGE=0", "TMPDIR=/tmp", "X=1"})
+	want := []string{
+		"PATH=/bin", "X=1",
+		"HOME=/t", "TMPDIR=/t/tmp",
+		"XDG_CACHE_HOME=/t/cache", "XDG_CONFIG_HOME=/t/config", "XDG_DATA_HOME=/t/data", "XDG_STATE_HOME=/t/state",
+		"GEMINI_HOME=/t/gemini", "AGY_ACP_FORCE_FILE_STORAGE=1",
+	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}

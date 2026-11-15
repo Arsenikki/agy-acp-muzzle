@@ -28,12 +28,16 @@ import (
 
 	"github.com/Arsenikki/agy-acp-muzzle/internal/policy"
 	"github.com/Arsenikki/agy-acp-muzzle/internal/relay"
+	"github.com/Arsenikki/agy-acp-muzzle/internal/sandbox"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == sandboxExecArg {
+		os.Exit(sandboxExecMain(os.Args[2:]))
+	}
 	os.Exit(run(os.Args[1:]))
 }
 
@@ -42,6 +46,12 @@ func run(args []string) int {
 	kernel := fs.String("kernel", os.Getenv("AGY_ACP_MUZZLE_KERNEL"), "path to the official agy_acp_server binary (or .par)")
 	locked := fs.Bool("locked", truthy(os.Getenv("AGY_LOCKDOWN")), "locked session for untrusted input: no tools, no MCP, empty workdir (default from $AGY_LOCKDOWN)")
 	tmpBase := fs.String("tmpdir", os.TempDir(), "where locked connections create their private directories")
+	var sb sandboxConfig
+	fs.BoolVar(&sb.disabled, "no-sandbox", false, "locked mode without the Landlock sandbox (debugging only)")
+	fs.Var(&sb.exec, "sandbox-exec", "extra paths the locked kernel may execute (repeatable, comma-separated)")
+	fs.Var(&sb.readOnly, "sandbox-ro", "extra paths the locked kernel may read")
+	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
+	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
 	verbose := fs.Bool("v", false, "debug logging on stderr")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -65,7 +75,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, stdin: os.Stdin, stdout: os.Stdout}
+	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, stdin: os.Stdin, stdout: os.Stdout}
 	if o.locked {
 		if o.srcHome, err = sourceGeminiHome(); err != nil {
 			log.Error("cannot resolve the Gemini home", "err", err)
@@ -101,10 +111,11 @@ func kernelArgv(kernel string, rest []string) ([]string, error) {
 
 // options configures one serve call.
 type options struct {
-	argv    []string  // kernel command line
-	locked  bool      // apply the locked policy
-	tmpBase string    // parent of a locked connection's private directories
-	srcHome string    // Gemini home holding the kernel credentials (locked)
+	argv    []string // kernel command line
+	locked  bool     // apply the locked policy
+	tmpBase string   // parent of a locked connection's private directories
+	srcHome string   // Gemini home holding the kernel credentials (locked)
+	sandbox sandboxConfig
 	stdin   io.Reader // client -> muzzle
 	stdout  io.Writer // muzzle -> client
 }
@@ -115,12 +126,16 @@ func serve(log *slog.Logger, o options) (int, error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cmd := exec.Command(o.argv[0], o.argv[1:]...)
-	cmd.Dir = filepath.Dir(o.argv[0])
-	cmd.Stderr = os.Stderr
-
+	argv := o.argv
+	var kernelEnv []string // nil: inherit
 	r := &relay.Relay{ClientIn: o.stdin, ClientOut: o.stdout}
 	if o.locked {
+		if !o.sandbox.disabled {
+			// Fail closed before touching anything.
+			if _, err := sandbox.Check(); err != nil {
+				return 1, fmt.Errorf("locked mode needs Landlock (--no-sandbox runs without it): %w", err)
+			}
+		}
 		env, err := prepareLocked(o.tmpBase, o.srcHome)
 		if err != nil {
 			return 1, err
@@ -130,11 +145,30 @@ func serve(log *slog.Logger, o options) (int, error) {
 				log.Warn("cleanup of locked directories failed", "err", err)
 			}
 		}()
-		cmd.Env = env.KernelEnv(os.Environ())
+		kernelEnv = env.KernelEnv(os.Environ())
+		if o.sandbox.disabled {
+			log.Warn("locked session without Landlock sandbox")
+		} else {
+			rules, err := kernelRules(o.argv[0], env.root, o.sandbox)
+			if err != nil {
+				return 1, err
+			}
+			var rulesEnv string
+			if argv, rulesEnv, err = sandboxedArgv(o.argv, rules); err != nil {
+				return 1, err
+			}
+			kernelEnv = append(kernelEnv, rulesEnv)
+			log.Debug("landlock rules", "exec", rules.Exec, "readWrite", rules.ReadWrite, "connectTCP", rules.ConnectTCP)
+		}
 		p := policy.NewLocked(env.Workdir)
 		r.FromClient, r.FromKernel = p.FromClient, p.FromKernel
 		log.Debug("locked session", "workdir", env.Workdir)
 	}
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = filepath.Dir(o.argv[0])
+	cmd.Env = kernelEnv
+	cmd.Stderr = os.Stderr
 	kin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1, err
