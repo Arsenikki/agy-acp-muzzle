@@ -151,7 +151,9 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
   over a websocket on a loopback port the harness picks. The sandbox
   therefore allows binding port 0 and connecting into the ephemeral port
   range (`ip_local_port_range`). Fixed-port services other than 443 stay
-  blocked.
+  blocked. Kernels differ in how they apply a port-0 bind rule: on some it also
+  allows binding fixed ports. Binding isn't exfiltration; connect rules
+  still apply.
 - **History:** `session/load` in a fresh process replays user messages and
   tool calls, and the model answers from the earlier turns.
 - **Memory per agent:** kernel about 300 MiB, harness about 140 MiB, muzzle
