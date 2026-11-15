@@ -52,7 +52,8 @@ func run(args []string) int {
 	fs.Var(&sb.readOnly, "sandbox-ro", "extra paths the locked kernel may read")
 	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
 	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
-	verbose := fs.Bool("v", false, "debug logging on stderr")
+	verbose := fs.Bool("v", truthy(os.Getenv("AGY_ACP_MUZZLE_DEBUG")), "debug logging, incl. every client request's method (default from $AGY_ACP_MUZZLE_DEBUG)")
+	logFile := fs.String("log-file", os.Getenv("AGY_ACP_MUZZLE_LOG_FILE"), "append logs to this file instead of stderr (clients often discard stderr)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -66,8 +67,18 @@ func run(args []string) int {
 	if *verbose {
 		level = slog.LevelDebug
 	}
-	// stdout carries the protocol, so logs go to stderr only.
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	// stdout carries the protocol, so logs never go there.
+	var logOut io.Writer = os.Stderr
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "agy-acp-muzzle: open log file:", err)
+			return 2
+		}
+		defer f.Close()
+		logOut = f
+	}
+	log := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level})).With("pid", os.Getpid())
 
 	argv, err := kernelArgv(*kernel, fs.Args())
 	if err != nil {
@@ -191,6 +202,9 @@ func serve(log *slog.Logger, o options) (int, error) {
 	}()
 
 	r.KernelIn, r.KernelOut = kin, kout
+	if log.Enabled(ctx, slog.LevelDebug) {
+		r.FromClient = traced(log, r.FromClient)
+	}
 	relayErr := r.Run()
 	waitErr := cmd.Wait()
 
