@@ -44,6 +44,10 @@ AGY_ACP_MUZZLE_KERNEL=/opt/agy-acp-server/agy_acp_server.par ./agy-acp-muzzle
 An idle kernel is stopped after `--idle-timeout` (default 3m, or
 `AGY_ACP_MUZZLE_IDLE_TIMEOUT`); the next request restores it and its sessions
 transparently, so an idle agent costs about 4 MiB instead of about 450 MiB.
+Client probes (`initialize` and `session/new` only, as Paseo sends per
+project) are answered from a cache of the kernel's last answers without
+starting anything; the kernel session is created on first use (`--no-cache`
+disables this).
 
 Locked mode needs the kernel to be logged in once (its credentials live in
 `$GEMINI_HOME/antigravity-acp/acp_token.json`); each locked connection gets a

@@ -48,6 +48,14 @@ type Supervisor struct {
 	RestoreTimeout time.Duration
 	Log            *slog.Logger
 
+	// Cache, if set, answers initialize and session/new without a kernel
+	// (see lazy.go); Sessions persists the placeholder ids it hands out.
+	Cache    Cache
+	Sessions SessionStore
+
+	lazy       map[string]*lazySession // placeholder -> session
+	realToLazy map[string]string       // kernel session id -> placeholder
+
 	toClient *lineWriter
 	k        *kernelConn
 	seq      int
@@ -91,6 +99,8 @@ func (s *Supervisor) Run() error {
 	s.pending = map[string]pendingSession{}
 	s.inflightClient = map[string]string{}
 	s.inflightKernel = map[string]bool{}
+	s.lazy = map[string]*lazySession{}
+	s.realToLazy = map[string]string{}
 
 	clientCh := make(chan []byte)
 	go readLines(s.ClientIn, clientCh, nil)
@@ -157,6 +167,16 @@ func (s *Supervisor) fromClient(line []byte) error {
 	if err != nil {
 		return s.toKernel(d.Forward)
 	}
+	if env.Kind() == acp.KindRequest {
+		if handled, err := s.answerFromCache(env, d.Forward); handled {
+			return err
+		}
+	}
+	forward, env, skip, err := s.mapToKernel(env, d.Forward)
+	if skip || err != nil {
+		return err
+	}
+	d.Forward = forward
 	id := string(env.ID)
 	switch env.Kind() {
 	case acp.KindResponse:
@@ -214,12 +234,25 @@ func (s *Supervisor) fromKernel(line []byte) error {
 		if strings.HasPrefix(id, `"`+svIDPrefix) {
 			return nil // late answer to a timed-out restore request
 		}
+		method := s.inflightClient[id]
 		delete(s.inflightClient, id)
+		if method == "initialize" && len(env.Result) > 0 && s.Cache != nil {
+			s.Cache.SaveInitialize(env.Result)
+		}
 		if p, ok := s.pending[id]; ok {
 			delete(s.pending, id)
 			if len(env.Result) > 0 {
 				s.rememberSession(p, env.Result)
+				if p.method == "session/new" && s.Cache != nil {
+					s.Cache.SaveSessionNew(env.Result)
+				}
 			}
+		}
+	} else if err == nil {
+		// Kernel requests and notifications name kernel session ids; the
+		// client knows lazily created sessions by their placeholders.
+		if ph, ok := s.realToLazy[sessionIDOf(env.Params)]; ok {
+			line = withSessionID(line, ph)
 		}
 	}
 
@@ -291,8 +324,12 @@ func (s *Supervisor) startKernel(restore bool) error {
 }
 
 func (s *Supervisor) restore() error {
-	if _, err := s.call(s.init); err != nil {
+	result, err := s.call(s.init, false)
+	if err != nil {
 		return fmt.Errorf("initialize: %w", err)
+	}
+	if s.Cache != nil {
+		s.Cache.SaveInitialize(result)
 	}
 	for _, sid := range s.order {
 		rec := s.sessions[sid]
@@ -302,12 +339,12 @@ func (s *Supervisor) restore() error {
 		}
 		params["sessionId"], _ = json.Marshal(sid)
 		req, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "session/load", "params": params})
-		if _, err := s.call(req); err != nil {
+		if _, err := s.call(req, false); err != nil {
 			s.Log.Warn("session not restored", "session", sid, "err", err)
 			continue
 		}
 		for _, setting := range rec.settings {
-			if _, err := s.call(setting); err != nil {
+			if _, err := s.call(setting, false); err != nil {
 				s.Log.Warn("setting not restored", "session", sid, "err", err)
 			}
 		}
@@ -316,10 +353,11 @@ func (s *Supervisor) restore() error {
 }
 
 // call sends req (its id replaced by a supervisor id) to the kernel and waits
-// for the answer. Notifications meanwhile are dropped: during session/load
-// they are the history replay the client already has. Kernel requests
-// meanwhile are refused.
-func (s *Supervisor) call(req []byte) (json.RawMessage, error) {
+// for the answer. Other kernel output meanwhile is either dropped (restore:
+// notifications are the history replay the client already has, requests are
+// refused) or, with passthrough, handled normally so concurrent sessions on
+// the connection are unaffected.
+func (s *Supervisor) call(req []byte, passthrough bool) (json.RawMessage, error) {
 	var msg map[string]json.RawMessage
 	if err := json.Unmarshal(req, &msg); err != nil {
 		return nil, err
@@ -340,19 +378,19 @@ func (s *Supervisor) call(req []byte) (json.RawMessage, error) {
 				return nil, errors.New("kernel exited")
 			}
 			env, err := acp.Parse(line)
-			if err != nil {
-				continue
-			}
-			switch env.Kind() {
-			case acp.KindResponse:
-				if !bytes.Equal(env.ID, want) {
-					continue
-				}
+			if err == nil && env.Kind() == acp.KindResponse && bytes.Equal(env.ID, want) {
 				if len(env.Error) > 0 {
 					return nil, fmt.Errorf("%s", env.Error)
 				}
 				return env.Result, nil
-			case acp.KindRequest:
+			}
+			if passthrough {
+				if err := s.fromKernel(line); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if err == nil && env.Kind() == acp.KindRequest {
 				reply, _ := acp.ErrorResponse(env.ID, acp.RPCError{Code: acp.CodeInternalError, Message: "agy-acp-muzzle: restoring"})
 				_ = s.toKernel(reply)
 			}
@@ -431,4 +469,103 @@ func readLines(r io.Reader, ch chan<- []byte, done <-chan struct{}) {
 			return
 		}
 	}
+}
+
+// answerFromCache answers initialize (with no kernel running) and
+// session/new from the cache, without starting a kernel.
+func (s *Supervisor) answerFromCache(env *acp.Envelope, forwarded []byte) (bool, error) {
+	if s.Cache == nil {
+		return false, nil
+	}
+	initResult, newResult := s.Cache.Load()
+	switch {
+	case env.Method == "initialize" && s.k == nil && initResult != nil:
+		s.init = forwarded
+		return true, s.replyResult(env.ID, initResult)
+	case env.Method == "session/new" && newResult != nil:
+		ph := newPlaceholder()
+		s.lazy[ph] = &lazySession{params: env.Params}
+		s.Log.Debug("session answered from cache", "placeholder", ph)
+		return true, s.replyResult(env.ID, withResultSessionID(newResult, ph))
+	}
+	return false, nil
+}
+
+// mapToKernel rewrites a client message naming a placeholder session to the
+// kernel's session id, creating the kernel session on first use. skip means
+// the message was fully handled (dropped or answered).
+func (s *Supervisor) mapToKernel(env *acp.Envelope, line []byte) ([]byte, *acp.Envelope, bool, error) {
+	ph := sessionIDOf(env.Params)
+	ls, known := s.lazy[ph]
+	if !known && ph != "" && s.Sessions != nil {
+		// A placeholder from an earlier connection (e.g. before a restart).
+		if real, ok := s.Sessions.Lookup(ph); ok {
+			ls = &lazySession{real: real}
+			s.lazy[ph], s.realToLazy[real] = ls, ph
+			known = true
+		}
+	}
+	if !known {
+		return line, env, false, nil
+	}
+	if ls.real == "" {
+		switch {
+		case env.Kind() != acp.KindRequest:
+			return nil, env, true, nil // e.g. session/cancel: nothing started yet
+		case env.Method == "session/load" || env.Method == "session/resume":
+			return nil, env, true, s.replyError(env.ID, -32002, "agy-acp-muzzle: session "+ph+" was never used")
+		}
+		if err := s.materialize(ph, ls); err != nil {
+			s.Log.Error("cannot create kernel session", "placeholder", ph, "err", err)
+			return nil, env, true, s.replyError(env.ID, acp.CodeInternalError, "agy-acp-muzzle: cannot create session: "+err.Error())
+		}
+	}
+	line = withSessionID(line, ls.real)
+	mapped, err := acp.Parse(line)
+	if err != nil {
+		return line, env, false, nil
+	}
+	return line, mapped, false, nil
+}
+
+// materialize creates the kernel session behind a placeholder.
+func (s *Supervisor) materialize(ph string, ls *lazySession) error {
+	if s.k == nil {
+		if err := s.startKernel(true); err != nil {
+			return err
+		}
+	}
+	started := time.Now()
+	req, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "session/new", "params": ls.params})
+	result, err := s.call(req, true)
+	if err != nil {
+		return err
+	}
+	var r struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(result, &r)
+	real := r.SessionID
+	if real == "" {
+		return errors.New("kernel returned no session id")
+	}
+	ls.real = real
+	s.realToLazy[real] = ph
+	s.rememberSession(pendingSession{method: "session/new", params: ls.params}, result)
+	if s.Sessions != nil {
+		s.Sessions.Store(ph, real)
+	}
+	if s.Cache != nil {
+		s.Cache.SaveSessionNew(result)
+	}
+	s.Log.Info("kernel session created", "placeholder", ph, "session", real, "took", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+func (s *Supervisor) replyResult(id json.RawMessage, result json.RawMessage) error {
+	out, err := acp.ResultResponse(id, result)
+	if err != nil {
+		return err
+	}
+	return s.toClient.WriteLine(out)
 }

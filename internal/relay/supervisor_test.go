@@ -312,3 +312,206 @@ func TestFiltersApply(t *testing.T) {
 	}
 	inW.Close()
 }
+
+type memCache struct {
+	mu        sync.Mutex
+	init, new json.RawMessage
+}
+
+func (c *memCache) Load() (json.RawMessage, json.RawMessage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.init, c.new
+}
+func (c *memCache) SaveInitialize(r json.RawMessage) { c.mu.Lock(); c.init = r; c.mu.Unlock() }
+func (c *memCache) SaveSessionNew(r json.RawMessage) {
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(r, &m)
+	delete(m, "sessionId")
+	b, _ := json.Marshal(m)
+	c.mu.Lock()
+	c.new = b
+	c.mu.Unlock()
+}
+
+type memStore struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (s *memStore) Lookup(ph string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.m[ph]
+	return r, ok
+}
+func (s *memStore) Store(ph, real string) { s.mu.Lock(); s.m[ph] = real; s.mu.Unlock() }
+
+func warmCache() *memCache {
+	return &memCache{
+		init: json.RawMessage(`{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}`),
+		new:  json.RawMessage(`{"modes":{"currentModeId":"default"},"models":{"currentModelId":"m1"}}`),
+	}
+}
+
+func runLazy(t *testing.T, f *fakeKernels, cache Cache, store SessionStore, idle time.Duration) *testClient {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	c := &testClient{t: t, in: inW, out: make(chan string, 64), done: make(chan error, 1)}
+	go func() {
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			c.out <- sc.Text()
+		}
+		close(c.out)
+	}()
+	s := &Supervisor{ClientIn: inR, ClientOut: outW, Start: f.start, Cache: cache, Sessions: store,
+		IdleTimeout: idle, RestoreTimeout: 5 * time.Second}
+	go func() {
+		c.done <- s.Run()
+		outW.Close()
+	}()
+	t.Cleanup(func() { inW.Close() })
+	return c
+}
+
+func placeholderOf(t *testing.T, r map[string]any) string {
+	t.Helper()
+	res, _ := r["result"].(map[string]any)
+	ph, _ := res["sessionId"].(string)
+	if ph == "" || ph == "s1" {
+		t.Fatalf("want a placeholder session id, got %v", r)
+	}
+	return ph
+}
+
+func TestProbeAnsweredWithoutKernel(t *testing.T) {
+	f := &fakeKernels{}
+	c := runLazy(t, f, warmCache(), &memStore{m: map[string]string{}}, 0)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	if r, _ := c.response(1); r["result"].(map[string]any)["agentCapabilities"] == nil {
+		t.Fatalf("initialize from cache: %v", r)
+	}
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	r, _ := c.response(2)
+	placeholderOf(t, r)
+	if r["result"].(map[string]any)["models"] == nil {
+		t.Fatalf("cached models missing: %v", r)
+	}
+	c.in.Close()
+	<-c.done
+	if started, _ := f.counts(); started != 0 {
+		t.Fatalf("a probe started %d kernels", started)
+	}
+}
+
+func TestLazySessionCreatedOnFirstUse(t *testing.T) {
+	f := &fakeKernels{}
+	store := &memStore{m: map[string]string{}}
+	c := runLazy(t, f, warmCache(), store, 0)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w","mcpServers":[]}}`)
+	r, _ := c.response(2)
+	ph := placeholderOf(t, r)
+
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"` + ph + `","modelId":"m2"}}`)
+	if r, _ := c.response(3); r["result"] == nil {
+		t.Fatalf("set_model: %v", r)
+	}
+	if got := f.methods(0); fmt.Sprint(got) != "[initialize session/new session/set_model]" {
+		t.Fatalf("kernel got %v", got)
+	}
+	if p := f.message(0, "session/set_model")["params"].(map[string]any); p["sessionId"] != "s1" {
+		t.Fatalf("set_model not mapped to the kernel session: %v", p)
+	}
+	if p := f.message(0, "session/new")["params"].(map[string]any); p["cwd"] != "/w" {
+		t.Fatalf("session/new params lost: %v", p)
+	}
+
+	c.send(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"` + ph + `","prompt":[]}}`)
+	_, notes := c.response(4)
+	if len(notes) == 0 || notes[0]["params"].(map[string]any)["sessionId"] != ph {
+		t.Fatalf("notification not mapped back to the placeholder: %v", notes)
+	}
+	if real, ok := store.Lookup(ph); !ok || real != "s1" {
+		t.Fatalf("placeholder not persisted: %q %v", real, ok)
+	}
+}
+
+func TestCacheFilledByRealKernel(t *testing.T) {
+	f := &fakeKernels{}
+	cache := &memCache{}
+	c := runLazy(t, f, cache, nil, 0)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	if r, _ := c.response(2); r["result"].(map[string]any)["sessionId"] != "s1" {
+		t.Fatalf("cold session/new should be the kernel's: %v", r)
+	}
+	init, sn := cache.Load()
+	if init == nil || sn == nil || strings.Contains(string(sn), "sessionId") {
+		t.Fatalf("cache = %s / %s", init, sn)
+	}
+}
+
+func TestPlaceholderLoadAfterReconnect(t *testing.T) {
+	f := &fakeKernels{}
+	store := &memStore{m: map[string]string{"11111111-2222-4333-8444-555555555555": "s1"}}
+	c := runLazy(t, f, warmCache(), store, 0)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"/w"}}`)
+	r, notes := c.response(2)
+	if r["result"] == nil {
+		t.Fatalf("load: %v", r)
+	}
+	if p := f.message(0, "session/load")["params"].(map[string]any); p["sessionId"] != "s1" {
+		t.Fatalf("load not mapped: %v", p)
+	}
+	// The client asked for this load, so it gets the history replay, under
+	// its own id.
+	if len(notes) == 0 || notes[0]["params"].(map[string]any)["sessionId"] != "11111111-2222-4333-8444-555555555555" {
+		t.Fatalf("replay = %v", notes)
+	}
+}
+
+func TestUnusedPlaceholderCannotBeLoaded(t *testing.T) {
+	f := &fakeKernels{}
+	c := runLazy(t, f, warmCache(), &memStore{m: map[string]string{}}, 0)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}`)
+	r, _ := c.response(2)
+	ph := placeholderOf(t, r)
+	c.send(`{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"` + ph + `"}}`)
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"session/load","params":{"sessionId":"` + ph + `"}}`)
+	if r, _ := c.response(3); r["error"] == nil {
+		t.Fatalf("load of an unused placeholder: %v", r)
+	}
+	if started, _ := f.counts(); started != 0 {
+		t.Fatalf("started %d kernels", started)
+	}
+}
+
+func TestLazySessionSurvivesIdleRestore(t *testing.T) {
+	f := &fakeKernels{}
+	c := runLazy(t, f, warmCache(), &memStore{m: map[string]string{}}, 50*time.Millisecond)
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	r, _ := c.response(2)
+	ph := placeholderOf(t, r)
+	c.send(`{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"` + ph + `","prompt":[]}}`)
+	c.response(3)
+	waitFor(t, func() bool { _, stopped := f.counts(); return stopped == 1 })
+	c.send(`{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"` + ph + `","prompt":[]}}`)
+	c.response(4)
+	if got := f.methods(1); fmt.Sprint(got) != "[initialize session/load session/prompt]" {
+		t.Fatalf("restored kernel got %v", got)
+	}
+	if p := f.message(1, "session/prompt")["params"].(map[string]any); p["sessionId"] != "s1" {
+		t.Fatalf("prompt after restore not mapped: %v", p)
+	}
+}
