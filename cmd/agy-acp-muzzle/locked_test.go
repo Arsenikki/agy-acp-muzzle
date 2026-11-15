@@ -44,8 +44,11 @@ func TestPrepareLockedCopiesOnlyCredentials(t *testing.T) {
 		}
 		return nil
 	})
-	if !slices.Equal(files, []string{consumerTokenRel}) {
+	if !slices.Equal(files, []string{consumerTokenRel, kernelSettingsRel}) {
 		t.Errorf("home contains %v", files)
+	}
+	if s, _ := os.ReadFile(filepath.Join(env.Home, kernelSettingsRel)); string(s) != defaultKernelSettings {
+		t.Errorf("default settings = %q", s)
 	}
 	entries, err := os.ReadDir(env.Workdir)
 	if err != nil || len(entries) != 0 {
@@ -94,5 +97,19 @@ func TestTruthy(t *testing.T) {
 		if truthy(v) {
 			t.Errorf("truthy(%q) = true", v)
 		}
+	}
+}
+
+func TestPrepareLockedKeepsOperatorSettings(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, consumerTokenRel), `{}`)
+	writeFile(t, filepath.Join(src, kernelSettingsRel), `{"auth":{"type":"gemini-api-key"}}`)
+	env, err := prepareLocked(t.TempDir(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer env.Cleanup()
+	if s, _ := os.ReadFile(filepath.Join(env.Home, kernelSettingsRel)); string(s) != `{"auth":{"type":"gemini-api-key"}}` {
+		t.Fatalf("settings = %q", s)
 	}
 }
