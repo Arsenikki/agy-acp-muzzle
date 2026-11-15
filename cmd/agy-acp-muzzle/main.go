@@ -53,6 +53,7 @@ func run(args []string) int {
 	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
 	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
 	verbose := fs.Bool("v", truthy(os.Getenv("AGY_ACP_MUZZLE_DEBUG")), "debug logging, incl. every client request's method (default from $AGY_ACP_MUZZLE_DEBUG)")
+	noCache := fs.Bool("no-cache", false, "always start the kernel for initialize and session/new (no probe fast path)")
 	idle := fs.Duration("idle-timeout", envDuration("AGY_ACP_MUZZLE_IDLE_TIMEOUT", 3*time.Minute), "stop the kernel after this long with nothing in flight; the next request restores it (0 disables)")
 	logFile := fs.String("log-file", os.Getenv("AGY_ACP_MUZZLE_LOG_FILE"), "append logs to this file instead of stderr (clients often discard stderr)")
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -87,12 +88,10 @@ func run(args []string) int {
 		return 2
 	}
 
-	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, stdin: os.Stdin, stdout: os.Stdout}
-	if o.locked {
-		if o.srcHome, err = sourceGeminiHome(); err != nil {
-			log.Error("cannot resolve the Gemini home", "err", err)
-			return 1
-		}
+	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, cache: !*noCache, stdin: os.Stdin, stdout: os.Stdout}
+	if o.srcHome, err = sourceGeminiHome(); err != nil {
+		log.Error("cannot resolve the Gemini home", "err", err)
+		return 1
 	}
 	code, err := serve(log, o)
 	if err != nil {
@@ -129,6 +128,7 @@ type options struct {
 	srcHome     string   // Gemini home holding the kernel credentials (locked)
 	sandbox     sandboxConfig
 	idleTimeout time.Duration // stop an idle kernel after this long (0: never)
+	cache       bool          // answer probes from the kernel's cached answers
 	stdin       io.Reader     // client -> muzzle
 	stdout      io.Writer     // muzzle -> client
 }
@@ -202,6 +202,9 @@ func serve(log *slog.Logger, o options) (int, error) {
 		FromKernel:  r.FromKernel,
 		IdleTimeout: o.idleTimeout,
 		Log:         log,
+	}
+	if o.cache {
+		s.Cache, s.Sessions = probeCache(log, o)
 	}
 	if log.Enabled(ctx, slog.LevelDebug) {
 		s.FromClient = traced(log, s.FromClient)

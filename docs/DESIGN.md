@@ -172,6 +172,23 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
   2.75 s, and the model answered from the turn before the shutdown. A
   kernel that dies on its own fails the requests in flight with an error;
   the next request restores it.
+- **Client probes:** Paseo probes an ACP provider once per known project
+  and worktree (8 here, 4 in parallel). Each probe sends `initialize` and
+  `session/new` to read modes and models, then kills the process. Against
+  the kernel every probe was a full start: 7-11 s each under contention,
+  with a burst of about 1.8 GiB.
+  - **Fast path:** the muzzle caches the kernel's last real `initialize` and
+    `session/new` answers (keyed by kernel build, 24 h TTL, next to the
+    kernel state). It answers probes from that cache with a placeholder
+    session id; nothing starts.
+  - **On first use:** the first request using the placeholder starts the
+    kernel, creates the real session and maps the ids in both directions.
+    The mapping is persisted (open mode), so `session/load` of a placeholder
+    after a restart still works.
+  - **Measured:** a probe took 0.0 s with no kernel, vs 13.5 s cold. The first
+    prompt in a lazy session took 8.5 s (kernel start plus 1.8 s session
+    creation). A placeholder loaded in a fresh process recalled the earlier
+    turn.
 - **Workspace pollution:** in open mode the kernel writes
   `skills/system/run-workflow/SKILL.md` into the session cwd (follow-up).
 
