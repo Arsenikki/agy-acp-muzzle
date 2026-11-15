@@ -58,8 +58,10 @@ func prepareLocked(tmpBase, srcHome string) (*lockedEnv, error) {
 		_ = os.RemoveAll(root)
 		return nil, err
 	}
-	if err := os.Mkdir(env.Workdir, 0o700); err != nil {
-		return fail(err)
+	for _, dir := range []string{env.Workdir, env.Tmp()} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			return fail(err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Join(env.Home, filepath.Dir(consumerTokenRel)), 0o700); err != nil {
 		return fail(err)
@@ -79,17 +81,36 @@ func (e *lockedEnv) Cleanup() error {
 	return os.RemoveAll(e.root)
 }
 
-// KernelEnv returns base with the Gemini home replaced and file credential
+// Tmp is the kernel's private TMPDIR.
+func (e *lockedEnv) Tmp() string { return filepath.Join(e.root, "tmp") }
+
+// KernelEnv returns base with HOME, TMPDIR, the XDG directories and the Gemini
+// home pointed into the connection's private root, and file credential
 // storage forced (there is no keychain to fall back to in a temp home).
 func (e *lockedEnv) KernelEnv(base []string) []string {
-	out := make([]string, 0, len(base)+2)
+	set := []string{
+		"HOME=" + e.root,
+		"TMPDIR=" + e.Tmp(),
+		"XDG_CACHE_HOME=" + filepath.Join(e.root, "cache"),
+		"XDG_CONFIG_HOME=" + filepath.Join(e.root, "config"),
+		"XDG_DATA_HOME=" + filepath.Join(e.root, "data"),
+		"XDG_STATE_HOME=" + filepath.Join(e.root, "state"),
+		"GEMINI_HOME=" + e.Home,
+		"AGY_ACP_FORCE_FILE_STORAGE=1",
+	}
+	replaced := map[string]bool{}
+	for _, kv := range set {
+		k, _, _ := strings.Cut(kv, "=")
+		replaced[k] = true
+	}
+	out := make([]string, 0, len(base)+len(set))
 	for _, kv := range base {
-		if strings.HasPrefix(kv, "GEMINI_HOME=") || strings.HasPrefix(kv, "AGY_ACP_FORCE_FILE_STORAGE=") {
+		if k, _, _ := strings.Cut(kv, "="); replaced[k] {
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out, "GEMINI_HOME="+e.Home, "AGY_ACP_FORCE_FILE_STORAGE=1")
+	return append(out, set...)
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {

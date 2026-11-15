@@ -6,23 +6,63 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Arsenikki/agy-acp-muzzle/internal/policy"
+	"github.com/Arsenikki/agy-acp-muzzle/internal/sandbox"
 )
 
 // fakeKernelEnv makes the test binary act as a minimal ACP kernel.
 const fakeKernelEnv = "AGY_ACP_MUZZLE_FAKE_KERNEL"
 
+// The fake kernel tries these from inside its sandbox (if any) and reports the
+// results in its initialize response.
+const (
+	probeSecretEnv = "AGY_ACP_MUZZLE_PROBE_SECRET" // a file outside the allowed paths
+	probeAddrEnv   = "AGY_ACP_MUZZLE_PROBE_ADDR"   // a local TCP listener
+)
+
 func TestMain(m *testing.M) {
+	// The launcher must win over the fake kernel: it is exec'd with the
+	// fake kernel's environment and then execs the fake kernel itself.
+	if len(os.Args) > 1 && os.Args[1] == sandboxExecArg {
+		os.Exit(sandboxExecMain(os.Args[2:]))
+	}
 	if os.Getenv(fakeKernelEnv) == "1" {
 		os.Exit(fakeKernel(os.Stdin, os.Stdout))
 	}
 	os.Exit(m.Run())
+}
+
+// probes reports, per action, "ok" or the error the fake kernel hit.
+func probes() map[string]string {
+	res := map[string]string{}
+	report := func(name string, err error) {
+		if err == nil {
+			res[name] = "ok"
+		} else {
+			res[name] = err.Error()
+		}
+	}
+	if p := os.Getenv(probeSecretEnv); p != "" {
+		_, err := os.ReadFile(p)
+		report("readSecret", err)
+	}
+	if a := os.Getenv(probeAddrEnv); a != "" {
+		c, err := net.DialTimeout("tcp", a, 2*time.Second)
+		if err == nil {
+			c.Close()
+		}
+		report("connect", err)
+	}
+	report("execShell", exec.Command("/bin/sh", "-c", "true").Run())
+	return res
 }
 
 // fakeKernel answers initialize and session/new by echoing what it received
@@ -55,6 +95,7 @@ func fakeKernel(in io.Reader, out io.Writer) int {
 				"geminiHome": os.Getenv("GEMINI_HOME"),
 				"forceFile":  os.Getenv("AGY_ACP_FORCE_FILE_STORAGE"),
 				"kernelCwd":  wd,
+				"probes":     probes(),
 			})
 		case "session/new":
 			reply(map[string]any{"sessionId": "s1", "modes": map[string]any{"currentModeId": "default"}, "echo": msg.Params})
@@ -164,11 +205,24 @@ func TestLockedEndToEnd(t *testing.T) {
 	writeFile(t, filepath.Join(src, consumerTokenRel), `{"refresh_token":"x"}`)
 	writeFile(t, filepath.Join(src, "config", "mcp_config.json"), `{}`)
 	tmpBase := t.TempDir()
+	setProbes(t)
 
-	c := startServe(t, options{locked: true, tmpBase: tmpBase, srcHome: src})
+	_, sbErr := sandbox.Check()
+	if sbErr != nil {
+		t.Logf("landlock unavailable, testing the policy without it: %v", sbErr)
+	}
+	c := startServe(t, options{locked: true, tmpBase: tmpBase, srcHome: src, sandbox: sandboxConfig{disabled: sbErr != nil}})
 
 	c.send(initLine)
 	init := c.next()
+	t.Logf("kernel probes: %v", path(init, "result", "probes"))
+	if sbErr == nil {
+		for _, probe := range []string{"readSecret", "connect", "execShell"} {
+			if got := path(init, "result", "probes", probe); got == "ok" || got == nil {
+				t.Errorf("sandboxed kernel %s: %v", probe, got)
+			}
+		}
+	}
 	if path(init, "result", "echo", "clientCapabilities", "fs") != nil || path(init, "result", "echo", "clientCapabilities", "terminal") != nil {
 		t.Errorf("client IO capabilities reached the kernel: %v", init)
 	}
@@ -223,12 +277,20 @@ func TestLockedEndToEnd(t *testing.T) {
 }
 
 func TestOpenEndToEnd(t *testing.T) {
+	setProbes(t)
 	c := startServe(t, options{})
 
 	c.send(initLine)
 	init := c.next()
 	if path(init, "result", "echo", "clientCapabilities", "fs") == nil {
 		t.Errorf("open mode stripped fs: %v", init)
+	}
+	// The same probes succeed unsandboxed, so the locked test's denials are
+	// the sandbox's doing.
+	for _, probe := range []string{"readSecret", "connect"} {
+		if got := path(init, "result", "probes", probe); got != "ok" {
+			t.Errorf("open kernel %s: %v", probe, got)
+		}
 	}
 
 	c.send(newLine)
@@ -266,4 +328,28 @@ func path(m map[string]any, keys ...string) any {
 		cur = obj[k]
 	}
 	return cur
+}
+
+// setProbes plants a secret outside every allowed path and starts a local TCP
+// listener on a port the sandbox does not allow, for the fake kernel to try.
+func setProbes(t *testing.T) {
+	t.Helper()
+	secret := filepath.Join(t.TempDir(), "secret")
+	writeFile(t, secret, "canary")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	t.Setenv(probeSecretEnv, secret)
+	t.Setenv(probeAddrEnv, l.Addr().String())
 }

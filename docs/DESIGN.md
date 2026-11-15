@@ -138,7 +138,8 @@ On the same daemon, an open session must keep full tools.
 1. ~~Transparent relay~~ (done). Runtime spike: history across restarts,
    resume, memory.
 2. ~~Locked-mode policy filters~~ (done; tested against a fake kernel).
-3. Landlock for the kernel child.
+3. ~~Landlock for the kernel child~~ (done; launcher re-exec, tested with
+   canary file, local listener and shell probes).
 4. Port the acceptance test; package for container images (pinned kernel and
    checksum).
 5. Open-mode extras: watchdog, empty-turn guard, concurrency cap.

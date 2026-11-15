@@ -8,9 +8,9 @@ allowed. `agy-acp-muzzle` wraps Google's official Antigravity ACP kernel with:
 - visible denials;
 - history that survives restarts.
 
-> **Status: pre-alpha.** The relay and the locked-mode policy are implemented
-> and tested against a fake kernel; Landlock and runtime tests against the real
-> kernel are next (see [docs/DESIGN.md](docs/DESIGN.md)).
+> **Status: pre-alpha.** The relay, the locked-mode policy and the Landlock
+> sandbox are implemented and tested against a fake kernel; runtime tests
+> against the real kernel are next (see [docs/DESIGN.md](docs/DESIGN.md)).
 
 ## How it works
 
@@ -43,7 +43,12 @@ AGY_ACP_MUZZLE_KERNEL=/opt/agy-acp-server/agy_acp_server.par ./agy-acp-muzzle
 
 Locked mode needs the kernel to be logged in once (its credentials live in
 `$GEMINI_HOME/antigravity-acp/acp_token.json`); each locked connection gets a
-private temporary Gemini home holding only that file.
+private temporary Gemini home holding only that file. The kernel then runs under
+Landlock: it may execute only its own directory, write only that private root,
+read a minimal set of system paths and connect only to TCP 443. Tune with
+`--sandbox-exec`, `--sandbox-ro`, `--sandbox-rw` and `--sandbox-port`; locked
+mode refuses to start where Landlock (ABI 4+) is unavailable unless
+`--no-sandbox` is given.
 
 As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
 
