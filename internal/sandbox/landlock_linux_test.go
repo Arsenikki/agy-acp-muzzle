@@ -82,6 +82,12 @@ func runAction(a string) error {
 			c.Close()
 		}
 		return err
+	case "listen":
+		l, err := net.Listen("tcp", arg)
+		if err == nil {
+			l.Close()
+		}
+		return err
 	}
 	return fmt.Errorf("unknown action %q", a)
 }
@@ -116,36 +122,29 @@ func listen(t *testing.T) (string, uint16) {
 	return l.Addr().String(), uint16(p)
 }
 
-func TestExecConfines(t *testing.T) {
-	if _, err := Check(); err != nil {
+// requireLandlock skips (or, with AGY_ACP_MUZZLE_REQUIRE_LANDLOCK=1, fails)
+// when the running kernel cannot enforce Rules, and returns its ABI.
+func requireLandlock(t *testing.T) int {
+	t.Helper()
+	abi, err := Check()
+	if err != nil {
 		if os.Getenv("AGY_ACP_MUZZLE_REQUIRE_LANDLOCK") == "1" {
 			t.Fatalf("landlock required but unavailable: %v", err)
 		}
 		t.Skipf("landlock unavailable: %v", err)
 	}
+	return abi
+}
+
+// probeExe returns the test binary and rules granting what it needs to run.
+func probeExe(t *testing.T) (string, Rules) {
+	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	exe, _ = filepath.EvalSymlinks(exe)
-
-	ro := t.TempDir()
-	rw := t.TempDir()
-	outside := t.TempDir()
-	for _, p := range []string{filepath.Join(ro, "allowed"), filepath.Join(outside, "secret")} {
-		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	allowedAddr, allowedPort := listen(t)
-	deniedAddr, _ := listen(t)
-
-	rules := Rules{
-		Exec:       []string{exe},
-		ReadOnly:   []string{ro, "/proc/self", "/etc"},
-		ReadWrite:  []string{rw, "/dev/null"},
-		ConnectTCP: []uint16{allowedPort},
-	}
+	rules := Rules{Exec: []string{exe}, ReadOnly: []string{"/proc/self", "/etc"}, ReadWrite: []string{"/dev/null"}}
 	if interp, err := Interpreter(exe); err != nil {
 		t.Fatal(err)
 	} else if interp != "" {
@@ -153,25 +152,14 @@ func TestExecConfines(t *testing.T) {
 		rules.Exec = append(rules.Exec, interp)
 		rules.ReadOnly = append(rules.ReadOnly, "/lib", "/lib64", "/usr/lib")
 	}
+	return exe, rules
+}
 
-	want := map[string]bool{ // action -> allowed
-		"read:" + filepath.Join(ro, "allowed"):     true,
-		"read:" + filepath.Join(outside, "secret"): false,
-		"write:" + filepath.Join(rw, "new"):        true,
-		"write:" + filepath.Join(ro, "new"):        false,
-		"write:" + filepath.Join(outside, "new"):   false,
-		"exec:/bin/sh":                             false,
-		"exec:/usr/bin/env":                        false,
-		"connect:" + allowedAddr:                   true,
-		"connect:" + deniedAddr:                    false,
-	}
-	var actions []string
-	for a := range want {
-		actions = append(actions, a)
-	}
+// runProbes launches the sandboxed probe and returns action -> outcome.
+func runProbes(t *testing.T, exe string, rules Rules, actions []string) map[string]string {
+	t.Helper()
 	rulesJSON, _ := json.Marshal(rules)
 	actionsJSON, _ := json.Marshal(actions)
-
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(), roleEnv+"=launch", "SANDBOX_TEST_RULES="+string(rulesJSON), "SANDBOX_TEST_ACTIONS="+string(actionsJSON))
 	out, err := cmd.Output()
@@ -186,6 +174,11 @@ func TestExecConfines(t *testing.T) {
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("probe output %q: %v", out, err)
 	}
+	return got
+}
+
+func check(t *testing.T, got map[string]string, want map[string]bool) {
+	t.Helper()
 	for action, allowed := range want {
 		res := got[action]
 		if allowed && res != "ok" {
@@ -195,9 +188,77 @@ func TestExecConfines(t *testing.T) {
 			t.Errorf("%s: want denied, but it succeeded", action)
 		}
 	}
+}
+
+func TestExecConfines(t *testing.T) {
+	abi := requireLandlock(t)
+	exe, rules := probeExe(t)
+
+	ro := t.TempDir()
+	rw := t.TempDir()
+	outside := t.TempDir()
+	for _, p := range []string{filepath.Join(ro, "allowed"), filepath.Join(outside, "secret")} {
+		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allowedAddr, allowedPort := listen(t)
+	deniedAddr, _ := listen(t)
+	rangeAddr, rangePort := listen(t)
+
+	rules.ReadOnly = append(rules.ReadOnly, ro)
+	rules.ReadWrite = append(rules.ReadWrite, rw)
+	rules.ConnectTCP = []uint16{allowedPort}
+	rules.ConnectTCPRanges = []PortRange{{Lo: rangePort, Hi: rangePort}}
+	rules.BindEphemeral = true
+
+	want := map[string]bool{ // action -> allowed
+		"read:" + filepath.Join(ro, "allowed"):     true,
+		"read:" + filepath.Join(outside, "secret"): false,
+		"write:" + filepath.Join(rw, "new"):        true,
+		"write:" + filepath.Join(ro, "new"):        false,
+		"write:" + filepath.Join(outside, "new"):   false,
+		"exec:/bin/sh":                             false,
+		"exec:/usr/bin/env":                        false,
+		"connect:" + allowedAddr:                   true,
+		"connect:" + deniedAddr:                    false,
+		"connect:" + rangeAddr:                     true,
+		"listen:127.0.0.1:0":                       true,
+	}
+	const fixedBind = "listen:127.0.0.1:18081"
+	actions := []string{fixedBind}
+	for a := range want {
+		actions = append(actions, a)
+	}
+	got := runProbes(t, exe, rules, actions)
+	check(t, got, want)
+	if got[fixedBind] == "ok" {
+		// How a port-0 bind rule treats fixed ports differs between kernel
+		// versions (some allow any bind). Binding is not exfiltration, so
+		// this is recorded, not failed; TestBindDeniedByDefault holds
+		// everywhere.
+		t.Logf("landlock ABI %d: port-0 bind rule also allowed a fixed-port bind", abi)
+	}
 	if _, err := os.Stat(filepath.Join(outside, "new")); !os.IsNotExist(err) {
 		t.Errorf("a file was written outside the allowed paths")
 	}
+}
+
+// TestBindDeniedByDefault records whether the running kernel enforces TCP bind
+// rules. Some do not (e.g. Linux 7.0 on GitHub runners allows every bind
+// while still enforcing connect rules); the muzzle relies on connect rules,
+// so this is informational.
+func TestBindDeniedByDefault(t *testing.T) {
+	abi := requireLandlock(t)
+	exe, rules := probeExe(t)
+	got := runProbes(t, exe, rules, []string{"listen:127.0.0.1:0", "listen:127.0.0.1:18082"})
+	if got["listen:127.0.0.1:0"] == "ok" && got["listen:127.0.0.1:18082"] == "ok" {
+		t.Skipf("landlock ABI %d: this kernel does not enforce TCP bind rules", abi)
+	}
+	check(t, got, map[string]bool{
+		"listen:127.0.0.1:0":     false,
+		"listen:127.0.0.1:18082": false,
+	})
 }
 
 func TestInterpreter(t *testing.T) {

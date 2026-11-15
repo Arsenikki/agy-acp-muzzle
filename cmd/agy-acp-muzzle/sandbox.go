@@ -65,6 +65,13 @@ func kernelRules(kernel, root string, cfg sandboxConfig) (sandbox.Rules, error) 
 	if interp != "" {
 		r.Exec = append(r.Exec, interp)
 	}
+	// The kernel talks to its native harness over a websocket on a loopback
+	// port the harness picks itself, so it must bind an ephemeral port and
+	// connect into the ephemeral range. Landlock filters ports, not
+	// addresses: fixed-port services (other than the allowed ones) stay
+	// unreachable, listeners inside the ephemeral range do not.
+	r.BindEphemeral = true
+	r.ConnectTCPRanges = []sandbox.PortRange{ephemeralRange()}
 	ports := cfg.ports
 	if len(ports) == 0 {
 		ports = listFlag{"443"}
@@ -130,4 +137,24 @@ func (l *listFlag) Set(v string) error {
 		}
 	}
 	return nil
+}
+
+// ephemeralRange is the local port range the kernel hands out for port-0
+// binds, with the Linux default as fallback.
+func ephemeralRange() sandbox.PortRange {
+	def := sandbox.PortRange{Lo: 32768, Hi: 60999}
+	b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return def
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return def
+	}
+	lo, err1 := strconv.ParseUint(f[0], 10, 16)
+	hi, err2 := strconv.ParseUint(f[1], 10, 16)
+	if err1 != nil || err2 != nil || lo == 0 || hi < lo {
+		return def
+	}
+	return sandbox.PortRange{Lo: uint16(lo), Hi: uint16(hi)}
 }

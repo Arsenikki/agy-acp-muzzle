@@ -47,6 +47,7 @@ func run() int {
 	permit := flag.String("permit", "reject", "answer to permission requests: reject or allow")
 	timeout := flag.Duration("timeout", 3*time.Minute, "overall timeout")
 	loadSession := flag.String("load", "", "session/load this session id instead of session/new")
+	authMethod := flag.String("authenticate", "", "call authenticate with this methodId after initialize (e.g. oauth-personal)")
 	raw := flag.Bool("raw", false, "print every raw line received")
 	flag.Parse()
 	argv := flag.Args()
@@ -72,7 +73,7 @@ func run() int {
 		os.Exit(124)
 	}()
 
-	code := c.script(*cwd, *model, *loadSession, prompts)
+	code := c.script(*cwd, *model, *loadSession, *authMethod, prompts)
 	_ = in.Close()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -84,13 +85,18 @@ func run() int {
 	return code
 }
 
-func (c *conn) script(cwd, model, load string, prompts []string) int {
+func (c *conn) script(cwd, model, load, auth string, prompts []string) int {
 	if _, err := c.call("initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{"fs": map[string]bool{"readTextFile": false, "writeTextFile": false}, "terminal": false},
 		"clientInfo":         map[string]string{"name": "acp-smoke", "version": "0"},
 	}); err != nil {
 		return c.fail("initialize", err)
+	}
+	if auth != "" {
+		if _, err := c.call("authenticate", map[string]any{"methodId": auth}); err != nil {
+			return c.fail("authenticate", err)
+		}
 	}
 	var sessionID string
 	if load != "" {

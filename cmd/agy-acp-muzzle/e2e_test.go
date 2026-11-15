@@ -339,9 +339,14 @@ func setProbes(t *testing.T) {
 	t.Helper()
 	secret := filepath.Join(t.TempDir(), "secret")
 	writeFile(t, secret, "canary")
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// A fixed port below the ephemeral range, like a real service: the locked
+	// kernel may connect into the ephemeral range (for its own harness).
+	var l net.Listener
+	for port := 20000; port < 30000 && l == nil; port++ {
+		l, _ = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	}
+	if l == nil {
+		t.Fatal("no free fixed port for the probe listener")
 	}
 	t.Cleanup(func() { l.Close() })
 	go func() {

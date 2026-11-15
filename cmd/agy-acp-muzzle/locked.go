@@ -13,6 +13,12 @@ import (
 // to the Gemini home.
 const consumerTokenRel = "antigravity-acp/acp_token.json"
 
+// kernelSettingsRel is the kernel's settings file (only auth and gcp blocks).
+const kernelSettingsRel = "antigravity-acp/settings.json"
+
+// defaultKernelSettings selects the consumer OAuth login.
+const defaultKernelSettings = `{"auth":{"type":"oauth-personal"}}` + "\n"
+
 // lockedEnv is the private filesystem of one locked connection.
 type lockedEnv struct {
 	root    string // removed on cleanup
@@ -72,6 +78,18 @@ func prepareLocked(tmpBase, srcHome string) (*lockedEnv, error) {
 			return fail(fmt.Errorf("no kernel credentials at %s: log in first", src))
 		}
 		return fail(err)
+	}
+	// Clients such as Paseo never call authenticate, so the kernel needs its
+	// auth method from settings.json: the operator's, or oauth-personal (the
+	// method acp_token.json belongs to).
+	dst := filepath.Join(env.Home, kernelSettingsRel)
+	if err := copyFile(filepath.Join(srcHome, kernelSettingsRel), dst, 0o600); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fail(err)
+		}
+		if err := os.WriteFile(dst, []byte(defaultKernelSettings), 0o600); err != nil {
+			return fail(err)
+		}
 	}
 	return env, nil
 }

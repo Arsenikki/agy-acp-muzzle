@@ -21,9 +21,20 @@ type Rules struct {
 	ReadOnly []string `json:"readOnly,omitempty"`
 	// ReadWrite paths may be read, written, created and removed.
 	ReadWrite []string `json:"readWrite,omitempty"`
-	// ConnectTCP lists the only TCP ports the process may connect to. Binding
-	// a TCP port is always denied. UDP is not covered by Landlock.
+	// ConnectTCP lists TCP ports the process may connect to. UDP is not
+	// covered by Landlock.
 	ConnectTCP []uint16 `json:"connectTCP,omitempty"`
+	// ConnectTCPRanges adds inclusive port ranges to ConnectTCP.
+	ConnectTCPRanges []PortRange `json:"connectTCPRanges,omitempty"`
+	// BindEphemeral allows binding TCP port 0 (a kernel-chosen ephemeral
+	// port). Binding any fixed port is always denied.
+	BindEphemeral bool `json:"bindEphemeral,omitempty"`
+}
+
+// PortRange is an inclusive TCP port range.
+type PortRange struct {
+	Lo uint16 `json:"lo"`
+	Hi uint16 `json:"hi"`
 }
 
 // ErrUnsupported means the running kernel cannot enforce the rules.
