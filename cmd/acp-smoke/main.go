@@ -49,6 +49,7 @@ func run() int {
 	loadSession := flag.String("load", "", "session/load this session id instead of session/new")
 	authMethod := flag.String("authenticate", "", "call authenticate with this methodId after initialize (e.g. oauth-personal)")
 	sessions := flag.Int("sessions", 1, "number of sessions to create on the one connection (each gets every prompt)")
+	pause := flag.Duration("pause", 0, "wait this long before each prompt after the first")
 	hold := flag.Duration("hold", 0, "keep the agent running this long after the last turn (for inspection)")
 	raw := flag.Bool("raw", false, "print every raw line received")
 	flag.Parse()
@@ -75,7 +76,7 @@ func run() int {
 		os.Exit(124)
 	}()
 
-	code := c.script(*cwd, *model, *loadSession, *authMethod, prompts, *sessions)
+	code := c.script(*cwd, *model, *loadSession, *authMethod, prompts, *sessions, *pause)
 	if *hold > 0 {
 		c.logf("holding for %s", *hold)
 		time.Sleep(*hold)
@@ -91,7 +92,7 @@ func run() int {
 	return code
 }
 
-func (c *conn) script(cwd, model, load, auth string, prompts []string, sessions int) int {
+func (c *conn) script(cwd, model, load, auth string, prompts []string, sessions int, pause time.Duration) int {
 	if _, err := c.call("initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{"fs": map[string]bool{"readTextFile": false, "writeTextFile": false}, "terminal": false},
@@ -106,7 +107,7 @@ func (c *conn) script(cwd, model, load, auth string, prompts []string, sessions 
 	}
 	code := 0
 	for n := 0; n < max(sessions, 1); n++ {
-		if c := c.session(cwd, model, load, prompts); c != 0 {
+		if c := c.session(cwd, model, load, prompts, pause); c != 0 {
 			code = c
 		}
 	}
@@ -114,7 +115,7 @@ func (c *conn) script(cwd, model, load, auth string, prompts []string, sessions 
 }
 
 // session opens (or loads) one session and runs every prompt in it.
-func (c *conn) session(cwd, model, load string, prompts []string) int {
+func (c *conn) session(cwd, model, load string, prompts []string, pause time.Duration) int {
 	var sessionID string
 	if load != "" {
 		if _, err := c.call("session/load", map[string]any{"sessionId": load, "cwd": cwd, "mcpServers": []any{}}); err != nil {
@@ -139,7 +140,11 @@ func (c *conn) session(cwd, model, load string, prompts []string) int {
 		}
 	}
 	code := 0
-	for _, p := range prompts {
+	for i, p := range prompts {
+		if i > 0 && pause > 0 {
+			c.logf("pausing %s", pause)
+			time.Sleep(pause)
+		}
 		c.resetText()
 		res, err := c.call("session/prompt", map[string]any{
 			"sessionId": sessionID,
