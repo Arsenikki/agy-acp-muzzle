@@ -20,11 +20,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Arsenikki/agy-acp-muzzle/internal/policy"
 	"github.com/Arsenikki/agy-acp-muzzle/internal/relay"
@@ -53,6 +53,7 @@ func run(args []string) int {
 	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
 	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
 	verbose := fs.Bool("v", truthy(os.Getenv("AGY_ACP_MUZZLE_DEBUG")), "debug logging, incl. every client request's method (default from $AGY_ACP_MUZZLE_DEBUG)")
+	idle := fs.Duration("idle-timeout", envDuration("AGY_ACP_MUZZLE_IDLE_TIMEOUT", 3*time.Minute), "stop the kernel after this long with nothing in flight; the next request restores it (0 disables)")
 	logFile := fs.String("log-file", os.Getenv("AGY_ACP_MUZZLE_LOG_FILE"), "append logs to this file instead of stderr (clients often discard stderr)")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
@@ -86,7 +87,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, stdin: os.Stdin, stdout: os.Stdout}
+	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, stdin: os.Stdin, stdout: os.Stdout}
 	if o.locked {
 		if o.srcHome, err = sourceGeminiHome(); err != nil {
 			log.Error("cannot resolve the Gemini home", "err", err)
@@ -122,13 +123,14 @@ func kernelArgv(kernel string, rest []string) ([]string, error) {
 
 // options configures one serve call.
 type options struct {
-	argv    []string // kernel command line
-	locked  bool     // apply the locked policy
-	tmpBase string   // parent of a locked connection's private directories
-	srcHome string   // Gemini home holding the kernel credentials (locked)
-	sandbox sandboxConfig
-	stdin   io.Reader // client -> muzzle
-	stdout  io.Writer // muzzle -> client
+	argv        []string // kernel command line
+	locked      bool     // apply the locked policy
+	tmpBase     string   // parent of a locked connection's private directories
+	srcHome     string   // Gemini home holding the kernel credentials (locked)
+	sandbox     sandboxConfig
+	idleTimeout time.Duration // stop an idle kernel after this long (0: never)
+	stdin       io.Reader     // client -> muzzle
+	stdout      io.Writer     // muzzle -> client
 }
 
 // serve starts the kernel, relays until its output ends and returns its exit
@@ -139,7 +141,7 @@ func serve(log *slog.Logger, o options) (int, error) {
 
 	argv := o.argv
 	var kernelEnv []string // nil: inherit
-	r := &relay.Relay{ClientIn: o.stdin, ClientOut: o.stdout}
+	var r struct{ FromClient, FromKernel relay.Filter }
 	if o.locked {
 		if !o.sandbox.disabled {
 			// Fail closed before touching anything.
@@ -176,45 +178,44 @@ func serve(log *slog.Logger, o options) (int, error) {
 		log.Debug("locked session", "workdir", env.Workdir)
 	}
 
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = filepath.Dir(o.argv[0])
-	cmd.Env = kernelEnv
-	cmd.Stderr = os.Stderr
-	kin, err := cmd.StdinPipe()
-	if err != nil {
-		return 1, err
+	start := func() (*relay.Process, error) {
+		return startKernel(log, argv, filepath.Dir(o.argv[0]), kernelEnv)
 	}
-	kout, err := cmd.StdoutPipe()
-	if err != nil {
-		return 1, err
-	}
-	if err := cmd.Start(); err != nil {
-		return 1, fmt.Errorf("start kernel: %w", err)
-	}
-	log.Debug("kernel started", "pid", cmd.Process.Pid, "argv0", o.argv[0])
 
-	// Forward a termination signal to the kernel and let it exit on its own.
+	// The supervisor ends when the client's input ends; a termination
+	// signal ends it the same way, so the kernel is stopped cleanly.
+	clientIn, closeClient := io.Pipe()
+	go func() {
+		_, err := io.Copy(closeClient, o.stdin)
+		closeClient.CloseWithError(err)
+	}()
 	go func() {
 		<-ctx.Done()
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-		}
+		closeClient.Close()
 	}()
 
-	r.KernelIn, r.KernelOut = kin, kout
+	s := &relay.Supervisor{
+		ClientIn:    clientIn,
+		ClientOut:   o.stdout,
+		Start:       start,
+		FromClient:  r.FromClient,
+		FromKernel:  r.FromKernel,
+		IdleTimeout: o.idleTimeout,
+		Log:         log,
+	}
 	if log.Enabled(ctx, slog.LevelDebug) {
-		r.FromClient = traced(log, r.FromClient)
+		s.FromClient = traced(log, s.FromClient)
 	}
-	relayErr := r.Run()
-	waitErr := cmd.Wait()
+	if err := s.Run(); err != nil {
+		return 1, err
+	}
+	return 0, nil
+}
 
-	var exitErr *exec.ExitError
-	switch {
-	case waitErr == nil:
-		return 0, relayErr
-	case errors.As(waitErr, &exitErr):
-		return exitErr.ExitCode(), relayErr
-	default:
-		return 1, errors.Join(relayErr, waitErr)
+// envDuration reads a duration from the environment, falling back to def.
+func envDuration(name string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(name)); err == nil {
+		return d
 	}
+	return def
 }

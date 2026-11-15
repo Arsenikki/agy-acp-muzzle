@@ -159,6 +159,19 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
   tool calls, and the model answers from the earlier turns.
 - **Memory per agent:** kernel about 300 MiB, harness about 140 MiB, muzzle
   about 4 MiB (vs about 250 MiB for one built-in `agy` CLI agent).
+  - One kernel serves many sessions on a connection, but each session gets
+    its own harness (about 160 MiB) that stays alive while the session is
+    idle.
+  - The kernel offers no per-session close over ACP; it only releases all
+    sessions on disconnect.
+- **Idle shutdown:** the muzzle stops the kernel after `--idle-timeout`
+  (default 3 min) with nothing in flight, so an idle agent costs only the
+  muzzle (about 4 MiB). The next request restarts the kernel, replays the
+  client's `initialize`, `session/load`s every session (dropping the history
+  replay) and re-applies mode and model settings. Measured: restore took
+  2.75 s, and the model answered from the turn before the shutdown. A
+  kernel that dies on its own fails the requests in flight with an error;
+  the next request restores it.
 - **Workspace pollution:** in open mode the kernel writes
   `skills/system/run-workflow/SKILL.md` into the session cwd (follow-up).
 
