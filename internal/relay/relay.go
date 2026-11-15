@@ -16,7 +16,7 @@ type Decision struct {
 	// Forward is written on to the line's destination; nil drops the line.
 	Forward []byte
 	// Reply, if non-nil, is written back to the line's sender (e.g. an error
-	// response to a request the muzzle refuses).
+	// response to a request the muzzle refuses), before Forward is written.
 	Reply []byte
 }
 
@@ -77,13 +77,17 @@ func pump(src io.Reader, dst, back *lineWriter, f Filter) error {
 			if f != nil {
 				d = f(line)
 			}
-			if d.Forward != nil {
-				if err := dst.WriteLine(d.Forward); err != nil {
+			// The reply goes first: when a filter both forwards a line and
+			// sends something back (e.g. a follow-up request to the kernel),
+			// the sender sees the reply before the forwarded line can trigger
+			// anything new from the other side.
+			if d.Reply != nil {
+				if err := back.WriteLine(d.Reply); err != nil {
 					return err
 				}
 			}
-			if d.Reply != nil {
-				if err := back.WriteLine(d.Reply); err != nil {
+			if d.Forward != nil {
+				if err := dst.WriteLine(d.Forward); err != nil {
 					return err
 				}
 			}
