@@ -48,6 +48,8 @@ func run() int {
 	timeout := flag.Duration("timeout", 3*time.Minute, "overall timeout")
 	loadSession := flag.String("load", "", "session/load this session id instead of session/new")
 	authMethod := flag.String("authenticate", "", "call authenticate with this methodId after initialize (e.g. oauth-personal)")
+	sessions := flag.Int("sessions", 1, "number of sessions to create on the one connection (each gets every prompt)")
+	hold := flag.Duration("hold", 0, "keep the agent running this long after the last turn (for inspection)")
 	raw := flag.Bool("raw", false, "print every raw line received")
 	flag.Parse()
 	argv := flag.Args()
@@ -73,7 +75,11 @@ func run() int {
 		os.Exit(124)
 	}()
 
-	code := c.script(*cwd, *model, *loadSession, *authMethod, prompts)
+	code := c.script(*cwd, *model, *loadSession, *authMethod, prompts, *sessions)
+	if *hold > 0 {
+		c.logf("holding for %s", *hold)
+		time.Sleep(*hold)
+	}
 	_ = in.Close()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -85,7 +91,7 @@ func run() int {
 	return code
 }
 
-func (c *conn) script(cwd, model, load, auth string, prompts []string) int {
+func (c *conn) script(cwd, model, load, auth string, prompts []string, sessions int) int {
 	if _, err := c.call("initialize", map[string]any{
 		"protocolVersion":    1,
 		"clientCapabilities": map[string]any{"fs": map[string]bool{"readTextFile": false, "writeTextFile": false}, "terminal": false},
@@ -98,6 +104,17 @@ func (c *conn) script(cwd, model, load, auth string, prompts []string) int {
 			return c.fail("authenticate", err)
 		}
 	}
+	code := 0
+	for n := 0; n < max(sessions, 1); n++ {
+		if c := c.session(cwd, model, load, prompts); c != 0 {
+			code = c
+		}
+	}
+	return code
+}
+
+// session opens (or loads) one session and runs every prompt in it.
+func (c *conn) session(cwd, model, load string, prompts []string) int {
 	var sessionID string
 	if load != "" {
 		if _, err := c.call("session/load", map[string]any{"sessionId": load, "cwd": cwd, "mcpServers": []any{}}); err != nil {
