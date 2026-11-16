@@ -26,6 +26,12 @@ type Cache interface {
 	SaveSessionNew(result json.RawMessage)
 }
 
+// CacheLocker is implemented by caches that can serialise filling an empty
+// cache across processes.
+type CacheLocker interface {
+	LockFill(timeout time.Duration) (release func(), err error)
+}
+
 // SessionStore persists placeholder -> kernel session ids, so a client that
 // reconnects (e.g. after a daemon restart) can still session/load a
 // placeholder it was given.
@@ -177,6 +183,8 @@ func (s *FileSessionStore) Store(placeholder, real string) {
 	}
 	_ = writeFileAtomic(filepath.Join(s.Dir, placeholder), []byte(real))
 }
+
+func dirOf(path string) string { return filepath.Dir(path) }
 
 func writeFileAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

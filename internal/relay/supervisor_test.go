@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -513,5 +514,27 @@ func TestLazySessionSurvivesIdleRestore(t *testing.T) {
 	}
 	if p := f.message(1, "session/prompt")["params"].(map[string]any); p["sessionId"] != "s1" {
 		t.Fatalf("prompt after restore not mapped: %v", p)
+	}
+}
+
+func TestColdCacheFilledOnce(t *testing.T) {
+	f := &fakeKernels{}
+	cache := &FileCache{Path: filepath.Join(t.TempDir(), "cache.json"), Key: "k", TTL: time.Hour}
+	c1 := runLazy(t, f, cache, nil, 0)
+	c2 := runLazy(t, f, cache, nil, 0)
+
+	c1.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c1.response(1) // c1 holds the fill lock and started the only kernel
+	c2.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	time.Sleep(100 * time.Millisecond) // c2 is now waiting on the lock
+
+	c1.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	c1.response(2) // fills the cache and releases the lock
+	c2.response(1)
+	c2.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	r, _ := c2.response(2)
+	placeholderOf(t, r)
+	if started, _ := f.counts(); started != 1 {
+		t.Fatalf("started %d kernels for a cold cache, want 1", started)
 	}
 }

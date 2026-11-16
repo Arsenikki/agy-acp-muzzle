@@ -31,7 +31,7 @@ func startKernel(log *slog.Logger, argv []string, dir string, env []string) (*re
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
 	cmd.Stderr = os.Stderr
-	setParentDeathSignal(cmd)
+	setKernelProcAttr(cmd)
 	err = cmd.Start()
 	stdinR.Close()
 	stdoutW.Close()
@@ -43,10 +43,19 @@ func startKernel(log *slog.Logger, argv []string, dir string, env []string) (*re
 	log.Debug("kernel started", "kernelPid", cmd.Process.Pid, "argv0", argv[0])
 
 	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
+	pid := cmd.Process.Pid
+	registerKernel(pid)
+	go func() {
+		err := cmd.Wait()
+		unregisterKernel(pid)
+		exited <- err
+	}()
 
 	stop := func() error {
 		defer stdoutR.Close()
+		// Whatever is left of the kernel's group (e.g. a harness whose
+		// parent already exited) goes with it.
+		defer signalKernelGroup(pid, syscall.SIGKILL)
 		stdinW.Close() // the kernel exits at EOF
 		for _, step := range []struct {
 			wait time.Duration
@@ -56,7 +65,7 @@ func startKernel(log *slog.Logger, argv []string, dir string, env []string) (*re
 			case err := <-exited:
 				return err
 			case <-time.After(step.wait):
-				_ = cmd.Process.Signal(step.sig)
+				signalKernelGroup(cmd.Process.Pid, step.sig)
 			}
 		}
 		return <-exited

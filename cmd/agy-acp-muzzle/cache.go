@@ -36,16 +36,13 @@ func probeCache(log *slog.Logger, o options) (relay.Cache, relay.SessionStore) {
 	return cache, &relay.FileSessionStore{Dir: filepath.Join(dir, "sessions")}
 }
 
-// kernelKey identifies the kernel build, so a kernel upgrade invalidates the
-// cached answers.
+// kernelKey identifies the kernel build (size and modification time, not its
+// path: the same build installed elsewhere answers the same), so a kernel
+// upgrade invalidates the cached answers.
 func kernelKey(kernel, mode string) (string, error) {
-	path, err := filepath.EvalSymlinks(kernel)
+	fi, err := os.Stat(kernel) // follows symlinks
 	if err != nil {
 		return "", err
 	}
-	fi, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%s|%s|%d|%d", mode, path, fi.Size(), fi.ModTime().UnixNano()), nil
+	return fmt.Sprintf("%s|%d|%d", mode, fi.Size(), fi.ModTime().UnixNano()), nil
 }

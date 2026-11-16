@@ -53,8 +53,9 @@ type Supervisor struct {
 	Cache    Cache
 	Sessions SessionStore
 
-	lazy       map[string]*lazySession // placeholder -> session
-	realToLazy map[string]string       // kernel session id -> placeholder
+	lazy        map[string]*lazySession // placeholder -> session
+	fillRelease func()                  // held while this connection fills a cold cache
+	realToLazy  map[string]string       // kernel session id -> placeholder
 
 	toClient *lineWriter
 	k        *kernelConn
@@ -108,6 +109,7 @@ func (s *Supervisor) Run() error {
 	idle := time.NewTimer(time.Hour)
 	idle.Stop()
 	defer s.stopKernel("client gone")
+	defer s.releaseFill()
 
 	for {
 		var kernelLines chan []byte
@@ -245,6 +247,7 @@ func (s *Supervisor) fromKernel(line []byte) error {
 				s.rememberSession(p, env.Result)
 				if p.method == "session/new" && s.Cache != nil {
 					s.Cache.SaveSessionNew(env.Result)
+					s.releaseFill()
 				}
 			}
 		}
@@ -425,6 +428,7 @@ func (s *Supervisor) stopKernel(reason string) {
 }
 
 func (s *Supervisor) reset() {
+	s.releaseFill() // a kernel that died cannot fill the cache
 	s.k = nil
 	clear(s.inflightClient)
 	clear(s.inflightKernel)
@@ -478,6 +482,9 @@ func (s *Supervisor) answerFromCache(env *acp.Envelope, forwarded []byte) (bool,
 		return false, nil
 	}
 	initResult, newResult := s.Cache.Load()
+	if env.Method == "initialize" && s.k == nil && (initResult == nil || newResult == nil) {
+		initResult, newResult = s.awaitCacheFill()
+	}
 	switch {
 	case env.Method == "initialize" && s.k == nil && initResult != nil:
 		s.init = forwarded
@@ -568,4 +575,39 @@ func (s *Supervisor) replyResult(id json.RawMessage, result json.RawMessage) err
 		return err
 	}
 	return s.toClient.WriteLine(out)
+}
+
+// fillLockTimeout bounds how long a connection waits for another one to fill
+// an empty cache before starting its own kernel.
+const fillLockTimeout = 90 * time.Second
+
+// awaitCacheFill handles a cold cache: it takes the cache's fill lock (waiting
+// while another connection fills it), then re-reads the cache. If the cache is
+// still cold this connection fills it and keeps the lock until session/new is
+// cached; otherwise it answers from what the other connection stored.
+func (s *Supervisor) awaitCacheFill() (json.RawMessage, json.RawMessage) {
+	l, ok := s.Cache.(CacheLocker)
+	if !ok || s.fillRelease != nil {
+		return s.Cache.Load()
+	}
+	release, err := l.LockFill(fillLockTimeout)
+	if err != nil {
+		s.Log.Warn("cache fill lock unavailable", "err", err)
+		return s.Cache.Load()
+	}
+	initResult, newResult := s.Cache.Load()
+	if initResult != nil && newResult != nil {
+		release()
+		return initResult, newResult
+	}
+	s.fillRelease = release
+	return initResult, newResult
+}
+
+// releaseFill drops the cache fill lock, if held.
+func (s *Supervisor) releaseFill() {
+	if s.fillRelease != nil {
+		s.fillRelease()
+		s.fillRelease = nil
+	}
 }
