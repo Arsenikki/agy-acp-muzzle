@@ -1,16 +1,41 @@
 # agy-acp-muzzle
 
 Headless agy runs full auto: every tool is approved and every shell command is
-allowed. `agy-acp-muzzle` wraps Google's official Antigravity ACP kernel with:
+allowed. `agy-acp-muzzle` wraps Google's official Antigravity ACP kernel and
+gives each session exactly the access you choose, with the kernel's own
+resource and reliability gaps fixed on the way.
 
-- per-session lockdown;
-- a Landlock sandbox;
-- visible denials;
-- history that survives restarts.
+> **Status: alpha.** Tested against the official kernel (`agy_acp_server`
+> 1.4.5) directly and as a Paseo provider; see [docs/DESIGN.md](docs/DESIGN.md)
+> for the design and measured results.
 
-> **Status: pre-alpha.** The relay, the locked-mode policy and the Landlock
-> sandbox are implemented and tested against a fake kernel; runtime tests
-> against the real kernel are next (see [docs/DESIGN.md](docs/DESIGN.md)).
+## Features
+
+- **Per-session lockdown.** A locked session gets:
+  - no built-in tools, no MCP servers and no client filesystem or terminal;
+  - an empty private workspace and Gemini home;
+  - every permission request rejected inside the muzzle, so client-side
+    auto-accept never sees one.
+
+  An open session keeps everything. The client picks the mode per session.
+- **Landlock sandbox** for locked kernels: execute only the kernel itself,
+  write only the private directory, read a minimal set of system paths,
+  connect only to TCP 443 (plus the kernel's own loopback IPC).
+- **Visible failures:**
+  - denied actions, kernel errors reported as text, and empty turns become
+    JSON-RPC errors instead of quiet successes;
+  - a watchdog cancels turns whose kernel goes silent;
+  - a kernel crash fails the request in flight, and the next request recovers.
+- **History that survives restarts:** `session/load` replays the
+  conversation from the kernel's own store.
+- **Cheap when idle:** an idle kernel is stopped and transparently restored
+  on the next request (about 4 MiB per idle agent instead of about 450 MiB).
+  Client probes for modes and models are answered from a cache without
+  starting a kernel.
+- **Clean workspaces:** `run_workflow` (which writes a skill file into the
+  workspace) is disabled by default; any built-in can be disabled.
+- **Clean process tree:** the kernel and its per-session harnesses are
+  stopped together, and orphans are reaped.
 
 ## How it works
 
@@ -18,45 +43,42 @@ allowed. `agy-acp-muzzle` wraps Google's official Antigravity ACP kernel with:
 ACP client (Paseo, Zed, ...)  <-- ACP -->  agy-acp-muzzle  <-- ACP -->  agy_acp_server (unmodified)
 ```
 
-The muzzle starts the official `agy_acp_server` as a child process and relays
-ACP (JSON-RPC over NDJSON) between it and the client, applying policy on the
-way:
+The muzzle starts the official kernel as a child process and relays ACP
+(JSON-RPC over NDJSON) between it and the client, applying policy on the way.
+The kernel is never modified or redistributed: you install and authenticate it
+yourself, under the [Antigravity terms](https://antigravity.google/terms).
 
-- **locked** sessions get no tools, no auto-approval, an empty workspace, no
-  MCP servers and a Landlock sandbox;
-- **open** sessions keep everything.
+## Install
 
-The client chooses the mode per session.
+1. **The muzzle:** download a static binary from
+   [Releases](https://github.com/Arsenikki/agy-acp-muzzle/releases) and
+   verify it against `SHA256SUMS`, or build it yourself:
 
-The kernel is never modified or redistributed. Install and authenticate it
-yourself under the [Antigravity terms](https://antigravity.google/terms).
+   ```bash
+   go build -o agy-acp-muzzle ./cmd/agy-acp-muzzle
+   ```
+
+2. **The kernel:** Google publishes it as `antigravity-acp` in the ACP agent
+   registry. Unpack the archive for your platform somewhere local and fast
+   (a kernel start reads several hundred MiB, so avoid slow network storage).
+
+3. **Log in once** with the kernel's consumer OAuth login (`oauth-personal`).
+   Its credentials end up in `$GEMINI_HOME/antigravity-acp/acp_token.json`
+   (`$GEMINI_HOME` defaults to `~/.gemini`). Clients that never call ACP
+   `authenticate` (such as Paseo) also need the method in
+   `$GEMINI_HOME/antigravity-acp/settings.json`:
+
+   ```json
+   {"auth": {"type": "oauth-personal"}}
+   ```
 
 ## Usage
 
 ```bash
-go build -o agy-acp-muzzle ./cmd/agy-acp-muzzle
-AGY_ACP_MUZZLE_KERNEL=/opt/agy-acp-server/agy_acp_server.par ./agy-acp-muzzle
-
-# locked session for untrusted input (or set AGY_LOCKDOWN=1)
-./agy-acp-muzzle --locked
+export AGY_ACP_MUZZLE_KERNEL=/opt/agy-acp-server/agy_acp_server.par
+agy-acp-muzzle             # open session
+agy-acp-muzzle --locked    # locked session (or AGY_LOCKDOWN=1)
 ```
-
-An idle kernel is stopped after `--idle-timeout` (default 3m, or
-`AGY_ACP_MUZZLE_IDLE_TIMEOUT`); the next request restores it and its sessions
-transparently, so an idle agent costs about 4 MiB instead of about 450 MiB.
-Client probes (`initialize` and `session/new` only, as Paseo sends per
-project) are answered from a cache of the kernel's last answers without
-starting anything; the kernel session is created on first use (`--no-cache`
-disables this).
-
-Locked mode needs the kernel to be logged in once (its credentials live in
-`$GEMINI_HOME/antigravity-acp/acp_token.json`); each locked connection gets a
-private temporary Gemini home holding only that file. The kernel then runs under
-Landlock: it may execute only its own directory, write only that private root,
-read a minimal set of system paths and connect only to TCP 443. Tune with
-`--sandbox-exec`, `--sandbox-ro`, `--sandbox-rw` and `--sandbox-port`; locked
-mode refuses to start where Landlock (ABI 4+) is unavailable unless
-`--no-sandbox` is given.
 
 As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
 
@@ -64,7 +86,7 @@ As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
 {
   "agents": {
     "providers": {
-      "agy": {
+      "agy-muzzle": {
         "extends": "acp",
         "label": "Antigravity (muzzled)",
         "command": ["/usr/local/bin/agy-acp-muzzle"],
@@ -74,6 +96,35 @@ As a Paseo custom ACP provider (`$PASEO_HOME/config.json`):
   }
 }
 ```
+
+A single run can then be locked with `paseo run --env AGY_LOCKDOWN=1 …`.
+
+## Configuration
+
+| Flag | Environment | Default | Purpose |
+|---|---|---|---|
+| `--kernel` | `AGY_ACP_MUZZLE_KERNEL` | | kernel `.par` or binary |
+| `--locked` | `AGY_LOCKDOWN` | off | locked session |
+| `--idle-timeout` | `AGY_ACP_MUZZLE_IDLE_TIMEOUT` | `3m` | stop an idle kernel (`0` keeps it) |
+| `--turn-timeout` | `AGY_ACP_MUZZLE_TURN_TIMEOUT` | `10m` | fail a turn after this long without kernel output |
+| `--turn-guard` | | on | fail kernel-error and empty turns |
+| `--disabled-tools` | `AGY_ACP_MUZZLE_DISABLED_TOOLS` | `run_workflow` | built-ins removed from open sessions |
+| `--no-cache` | | off | always start the kernel for probes |
+| `--sandbox-exec`, `--sandbox-ro`, `--sandbox-rw`, `--sandbox-port` | | | extend the locked Landlock rules |
+| `--no-sandbox` | | off | locked mode without Landlock (debugging only) |
+| `--log-file`, `-v` | `AGY_ACP_MUZZLE_LOG_FILE`, `AGY_ACP_MUZZLE_DEBUG` | stderr, info | logging (many clients discard stderr) |
+
+Locked mode requires Landlock ABI 4 or newer (Linux 6.7+) and refuses to
+start without it unless `--no-sandbox` is given.
+
+## Limitations
+
+- **Memory while active:** a running turn costs about 450 MiB (about 295 MiB
+  of it the kernel's Python runtime), more than the agy CLI. Idle shutdown
+  removes that cost between turns.
+- **Models:** the official ACP kernel lists only Gemini models for clients
+  other than a few IDEs. The muzzle doesn't change that.
+- **Platform:** Linux only for the sandbox and process management.
 
 ## Development
 
