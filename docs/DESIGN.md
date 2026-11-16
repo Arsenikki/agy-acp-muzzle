@@ -18,9 +18,9 @@ agy --input-format stream-json --output-format stream-json --add-dir <cwd> \
 
 `--dangerously-skip-permissions` is hard-coded, so every tool call, including
 shell commands, file access outside the workspace and network fetches, runs
-without asking. That is the wrong default for agents fed untrusted input (for
-example a scheduled job summarising email) and gives a shared daemon no way to
-lock down one session while others keep their tools.
+without asking. That is the wrong default for agents fed untrusted input
+(anything an attacker can write into a prompt) and gives a shared daemon no
+way to lock down one session while others keep their tools.
 
 There are further gaps compared with providers such as Claude Code:
 
@@ -110,8 +110,7 @@ so `enabledTools: []` should remove it *(verify)*).
 
 ### Acceptance (locked)
 
-These checks are ported from an existing CLI lockdown test. A locked session
-must:
+A locked session must:
 
 1. not return a random secret planted outside its workspace;
 2. not reach a local HTTP listener;
@@ -123,8 +122,8 @@ On the same daemon, an open session must keep full tools.
 
 ## Runtime results (official kernel 1.4.5, 2026-11-15)
 
-Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
-6.18 (Landlock ABI 7):
+Run with `cmd/acp-smoke` through the muzzle, in a container on Linux 6.18
+(Landlock ABI 7):
 
 - **Auth:** the kernel reuses an existing consumer login from
   `antigravity-acp/acp_token.json`. Clients that never call `authenticate`
@@ -173,7 +172,7 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
   kernel that dies on its own fails the requests in flight with an error;
   the next request restores it.
 - **Client probes:** Paseo probes an ACP provider once per known project
-  and worktree (8 here, 4 in parallel). Each probe sends `initialize` and
+  and worktree (often several, in parallel). Each probe sends `initialize` and
   `session/new` to read modes and models, then kills the process. Against
   the kernel every probe was a full start: 7-11 s each under contention,
   with a burst of about 1.8 GiB.
@@ -190,8 +189,8 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
     creation). A placeholder loaded in a fresh process recalled the earlier
     turn.
 - **Storage:** kernel start time is dominated by reading about 350 MiB of
-  kernel and about 40 MiB of harness files. From a Longhorn PVC (30.8 MB/s,
-  half of the reads served by a remote replica) that was 10 s for
+  kernel and about 40 MiB of harness files. From replicated network block
+  storage (30.8 MB/s) that was 10 s for
   `initialize` and 8 s for session creation. From node-local disk
   (2.8 GB/s) the first session took 2.9 s and a further lazy session
   484 ms. Ship the kernel in the image, not on a PVC.
@@ -212,23 +211,30 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
 
 ## Open questions
 
-- **Startup:** the minimum `GEMINI_HOME` contents for an authenticated
-  kernel start.
-- **Memory:** use per kernel process (one per agent).
 - **Subagents:** whether `invoke_subagent` and the browser subagent honour the
-  session tool filter.
-- **Exec allowlist:** which executables the kernel spawns internally (the
-  Landlock allowlist must match).
-- **Paseo env:** whether the Paseo `--env` overlay reaches custom ACP
-  providers in every daemon version we care about.
+  session tool filter (unverified; locked sessions disable both built-ins).
+- **Concurrency cap:** one account serving many agents at once may hit
+  backend rate limits; a per-account cap on concurrent turns is not
+  implemented.
+- **Interactive login:** the kernel's OAuth login currently happens outside
+  the muzzle; a `--login` helper (ACP `authenticate` with `oauth-personal`)
+  would make headless setups easier.
+
+Answered by the runtime results above:
+
+- **Startup:** `acp_token.json` plus `settings.json` with `auth.type`.
+- **Memory:** about 295 MiB per kernel plus about 160 MiB per session harness;
+  idle agents cost about 4 MiB with idle shutdown.
+- **Exec allowlist:** the kernel runs only its own `.par` and
+  `localharness_external`.
+- **Paseo env:** `paseo run --env AGY_LOCKDOWN=1` reaches the muzzle (a locked
+  session refused `--mode yolo`).
 
 ## Roadmap
 
-1. ~~Transparent relay~~ (done). Runtime spike: history across restarts,
-   resume, memory.
-2. ~~Locked-mode policy filters~~ (done; tested against a fake kernel).
-3. ~~Landlock for the kernel child~~ (done; launcher re-exec, tested with
-   canary file, local listener and shell probes).
-4. Port the acceptance test; package for container images (pinned kernel and
-   checksum).
-5. Open-mode extras: watchdog, empty-turn guard, concurrency cap.
+1. ~~Transparent relay, locked-mode policy, Landlock~~ (done).
+2. ~~Idle shutdown, probe cache with lazy sessions, turn guards, process-tree
+   hygiene~~ (done; verified against the official kernel).
+3. ~~Release binaries with checksums~~ (done).
+4. Container image recipe (pinned kernel and checksum, an init process that
+   reaps), interactive login helper, per-account concurrency cap.
