@@ -34,6 +34,7 @@ func (f *fakeKernels) start() (*Process, error) {
 		defer close(done)
 		defer outW.Close()
 		sc := bufio.NewScanner(inR)
+		sc.Buffer(make([]byte, 64<<10), 64<<20)
 		send := func(v any) {
 			b, _ := json.Marshal(v)
 			fmt.Fprintf(outW, "%s\n", b)
@@ -61,6 +62,11 @@ func (f *fakeKernels) start() (*Process, error) {
 				update("replayed history")
 				reply(map[string]any{})
 			case "session/prompt":
+				if strings.HasPrefix(promptText(m), "size:") {
+					update(fmt.Sprint(len(promptText(m))))
+					reply(map[string]any{"stopReason": "end_turn"})
+					continue
+				}
 				switch promptText(m) {
 				case "kernel-error":
 					update("Agent execution error: model output error: boom")
@@ -661,5 +667,21 @@ func TestWatchdogWaitsWhileKernelAsksClient(t *testing.T) {
 	c.send(`{"jsonrpc":"2.0","id":"k1","result":{"outcome":{"outcome":"cancelled"}}}`)
 	if r, _ := c.response(3); r["result"] == nil {
 		t.Fatalf("turn after the client answered: %v", r)
+	}
+}
+
+func TestLargeLinesPassIntact(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) {})
+	openSession(c)
+	text := "size:" + strings.Repeat("A", 12<<20) // like a base64 image
+	c.send(prompt(3, text))
+	r, notes := c.response(3)
+	if r["result"] == nil || len(notes) == 0 {
+		t.Fatalf("large prompt: %v", r)
+	}
+	got := notes[0]["params"].(map[string]any)["update"].(map[string]any)["content"].(map[string]any)["text"]
+	if got != fmt.Sprint(len(text)) {
+		t.Fatalf("kernel saw a %v-byte prompt, want %d", got, len(text))
 	}
 }
