@@ -53,6 +53,8 @@ func run(args []string) int {
 	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
 	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
 	verbose := fs.Bool("v", truthy(os.Getenv("AGY_ACP_MUZZLE_DEBUG")), "debug logging, incl. every client request's method (default from $AGY_ACP_MUZZLE_DEBUG)")
+	var disabledTools listFlag
+	fs.Var(&disabledTools, "disabled-tools", "built-in kernel tools to disable in open sessions (repeatable, comma-separated; replaces the default \"run_workflow\"; also $AGY_ACP_MUZZLE_DISABLED_TOOLS)")
 	turnGuard := fs.Bool("turn-guard", true, "fail turns that end in a kernel error text or without any output")
 	turnTimeout := fs.Duration("turn-timeout", envDuration("AGY_ACP_MUZZLE_TURN_TIMEOUT", 10*time.Minute), "fail and cancel a turn whose kernel produces no output for this long (0 disables)")
 	noCache := fs.Bool("no-cache", false, "always start the kernel for initialize and session/new (no probe fast path)")
@@ -62,6 +64,7 @@ func run(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	disabledTools = resolveDisabledTools(fs, disabledTools)
 	if *showVersion {
 		fmt.Println(version)
 		return 0
@@ -91,7 +94,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, turnGuard: *turnGuard, turnTimeout: *turnTimeout, cache: !*noCache, stdin: os.Stdin, stdout: os.Stdout}
+	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, disabledTools: disabledTools, idleTimeout: *idle, turnGuard: *turnGuard, turnTimeout: *turnTimeout, cache: !*noCache, stdin: os.Stdin, stdout: os.Stdout}
 	if o.srcHome, err = sourceGeminiHome(); err != nil {
 		log.Error("cannot resolve the Gemini home", "err", err)
 		return 1
@@ -125,17 +128,18 @@ func kernelArgv(kernel string, rest []string) ([]string, error) {
 
 // options configures one serve call.
 type options struct {
-	argv        []string // kernel command line
-	locked      bool     // apply the locked policy
-	tmpBase     string   // parent of a locked connection's private directories
-	srcHome     string   // Gemini home holding the kernel credentials (locked)
-	sandbox     sandboxConfig
-	idleTimeout time.Duration // stop an idle kernel after this long (0: never)
-	cache       bool          // answer probes from the kernel's cached answers
-	turnGuard   bool          // fail kernel-error and empty turns
-	turnTimeout time.Duration // fail a turn after this long without kernel output
-	stdin       io.Reader     // client -> muzzle
-	stdout      io.Writer     // muzzle -> client
+	argv          []string // kernel command line
+	locked        bool     // apply the locked policy
+	tmpBase       string   // parent of a locked connection's private directories
+	srcHome       string   // Gemini home holding the kernel credentials (locked)
+	sandbox       sandboxConfig
+	idleTimeout   time.Duration // stop an idle kernel after this long (0: never)
+	cache         bool          // answer probes from the kernel's cached answers
+	turnGuard     bool          // fail kernel-error and empty turns
+	disabledTools []string      // built-in tools taken away from open sessions
+	turnTimeout   time.Duration // fail a turn after this long without kernel output
+	stdin         io.Reader     // client -> muzzle
+	stdout        io.Writer     // muzzle -> client
 }
 
 // serve starts the kernel, relays until its output ends and returns its exit
@@ -183,6 +187,9 @@ func serve(log *slog.Logger, o options) (int, error) {
 		log.Debug("locked session", "workdir", env.Workdir)
 	}
 
+	if !o.locked && len(o.disabledTools) > 0 {
+		r.FromClient = (&policy.Open{DisabledTools: o.disabledTools}).FromClient
+	}
 	start := func() (*relay.Process, error) {
 		return startKernel(log, argv, filepath.Dir(o.argv[0]), kernelEnv)
 	}

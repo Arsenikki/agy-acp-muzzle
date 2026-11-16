@@ -204,7 +204,11 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
   is silent that long. It doesn't fire while the kernel waits on the client
   (e.g. a permission prompt).
 - **Workspace pollution:** in open mode the kernel writes
-  `skills/system/run-workflow/SKILL.md` into the session cwd (follow-up).
+  `skills/system/run-workflow/SKILL.md` into the session cwd. It comes from
+  the `run_workflow` built-in: with it disabled the workspace stays empty
+  (verified). Open mode now disables `run_workflow` by default
+  (`--disabled-tools` / `AGY_ACP_MUZZLE_DISABLED_TOOLS` replace the default).
+  The same option takes any other built-in away from a provider.
 
 ## Open questions
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -157,4 +158,29 @@ func ephemeralRange() sandbox.PortRange {
 		return def
 	}
 	return sandbox.PortRange{Lo: uint16(lo), Hi: uint16(hi)}
+}
+
+// defaultDisabledTools are taken away from open sessions unless configured
+// otherwise: run_workflow makes the kernel write
+// skills/system/run-workflow/SKILL.md into the session's workspace.
+var defaultDisabledTools = listFlag{"run_workflow"}
+
+// resolveDisabledTools picks the open-mode tool denylist: the flag if given,
+// else $AGY_ACP_MUZZLE_DISABLED_TOOLS if set (even to empty), else the default.
+func resolveDisabledTools(fs *flag.FlagSet, fromFlag listFlag) listFlag {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "disabled-tools" {
+			given = true
+		}
+	})
+	if given {
+		return fromFlag
+	}
+	if v, ok := os.LookupEnv("AGY_ACP_MUZZLE_DISABLED_TOOLS"); ok {
+		var l listFlag
+		_ = l.Set(v)
+		return l
+	}
+	return defaultDisabledTools
 }

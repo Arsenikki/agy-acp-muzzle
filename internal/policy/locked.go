@@ -86,7 +86,7 @@ func (p *Locked) FromClient(line []byte) relay.Decision {
 	}
 	switch env.Method {
 	case methodInitialize:
-		return p.rewrite(line, env, stripClientCapabilities)
+		return rewrite(line, env, stripClientCapabilities)
 	case methodSessionNew, methodSessionLoad, methodSessionResume:
 		var params struct {
 			SessionID string `json:"sessionId"`
@@ -95,7 +95,7 @@ func (p *Locked) FromClient(line []byte) relay.Decision {
 		p.mu.Lock()
 		p.sessionReqs[string(env.ID)] = params.SessionID
 		p.mu.Unlock()
-		return p.rewrite(line, env, p.lockSession)
+		return rewrite(line, env, p.lockSession)
 	case methodSessionPrompt:
 		var params struct {
 			SessionID string `json:"sessionId"`
@@ -319,7 +319,7 @@ func stripClientCapabilities(params map[string]any) {
 
 // rewrite applies edit to a request's params object and re-encodes the line.
 // A request whose params cannot be decoded is refused, never forwarded as-is.
-func (p *Locked) rewrite(line []byte, env *acp.Envelope, edit func(map[string]any)) relay.Decision {
+func rewrite(line []byte, env *acp.Envelope, edit func(map[string]any)) relay.Decision {
 	params := map[string]any{}
 	if len(env.Params) > 0 {
 		if err := json.Unmarshal(env.Params, &params); err != nil {
