@@ -81,6 +81,7 @@ func run(args []string) int {
 		logOut = f
 	}
 	log := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level})).With("pid", os.Getpid())
+	startReaper(log)
 
 	argv, err := kernelArgv(*kernel, fs.Args())
 	if err != nil {

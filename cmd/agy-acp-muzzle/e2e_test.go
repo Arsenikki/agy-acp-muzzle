@@ -21,6 +21,9 @@ import (
 // fakeKernelEnv makes the test binary act as a minimal ACP kernel.
 const fakeKernelEnv = "AGY_ACP_MUZZLE_FAKE_KERNEL"
 
+// orphanEnv makes the test binary a short-lived grandchild of the muzzle.
+const orphanEnv = "AGY_ACP_MUZZLE_ORPHAN"
+
 // The fake kernel tries these from inside its sandbox (if any) and reports the
 // results in its initialize response.
 const (
@@ -33,6 +36,10 @@ func TestMain(m *testing.M) {
 	// fake kernel's environment and then execs the fake kernel itself.
 	if len(os.Args) > 1 && os.Args[1] == sandboxExecArg {
 		os.Exit(sandboxExecMain(os.Args[2:]))
+	}
+	if os.Getenv(orphanEnv) == "1" {
+		time.Sleep(300 * time.Millisecond) // outlive the fake kernel
+		os.Exit(0)
 	}
 	if os.Getenv(fakeKernelEnv) == "1" {
 		os.Exit(fakeKernel(os.Stdin, os.Stdout))
@@ -97,6 +104,13 @@ func fakeKernel(in io.Reader, out io.Writer) int {
 				"kernelCwd":  wd,
 				"probes":     probes(),
 			})
+		case "orphan":
+			// Start a child that outlives this kernel, like a harness.
+			exe, _ := os.Executable()
+			child := exec.Command(exe)
+			child.Env = append(os.Environ(), orphanEnv+"=1")
+			_ = child.Start()
+			reply(map[string]any{"pid": child.Process.Pid})
 		case "session/new":
 			reply(map[string]any{"sessionId": "s1", "modes": map[string]any{"currentModeId": "default"}, "echo": msg.Params})
 		case "session/prompt":
@@ -360,4 +374,27 @@ func setProbes(t *testing.T) {
 	}()
 	t.Setenv(probeSecretEnv, secret)
 	t.Setenv(probeAddrEnv, l.Addr().String())
+}
+
+func TestOrphansReaped(t *testing.T) {
+	startReaper(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c := startServe(t, options{})
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"orphan","params":{}}`)
+	r := c.next()
+	pid := int(path(r, "result", "pid").(float64))
+	if code := c.close(); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	// The kernel is gone; its child must not linger as a zombie.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			return // reaped
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grandchild %d not reaped: %s", pid, b)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
