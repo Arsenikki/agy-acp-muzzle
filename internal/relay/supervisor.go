@@ -48,14 +48,22 @@ type Supervisor struct {
 	RestoreTimeout time.Duration
 	Log            *slog.Logger
 
+	// TurnGuard fails turns that end in a kernel error text or with no
+	// output; TurnTimeout fails and cancels a turn whose kernel is silent
+	// for that long (zero disables). See turns.go.
+	TurnGuard   bool
+	TurnTimeout time.Duration
+
 	// Cache, if set, answers initialize and session/new without a kernel
 	// (see lazy.go); Sessions persists the placeholder ids it hands out.
 	Cache    Cache
 	Sessions SessionStore
 
-	lazy        map[string]*lazySession // placeholder -> session
-	fillRelease func()                  // held while this connection fills a cold cache
-	realToLazy  map[string]string       // kernel session id -> placeholder
+	lazy             map[string]*lazySession // placeholder -> session
+	fillRelease      func()                  // held while this connection fills a cold cache
+	realToLazy       map[string]string       // kernel session id -> placeholder
+	turns            map[string]*turn        // prompt request id -> turn
+	lastKernelOutput time.Time
 
 	toClient *lineWriter
 	k        *kernelConn
@@ -102,12 +110,15 @@ func (s *Supervisor) Run() error {
 	s.inflightKernel = map[string]bool{}
 	s.lazy = map[string]*lazySession{}
 	s.realToLazy = map[string]string{}
+	s.turns = map[string]*turn{}
 
 	clientCh := make(chan []byte)
 	go readLines(s.ClientIn, clientCh, nil)
 
 	idle := time.NewTimer(time.Hour)
 	idle.Stop()
+	watchdog := time.NewTicker(watchdogInterval(s.TurnTimeout))
+	defer watchdog.Stop()
 	defer s.stopKernel("client gone")
 	defer s.releaseFill()
 
@@ -136,6 +147,8 @@ func (s *Supervisor) Run() error {
 			if s.idle() {
 				s.stopKernel("idle")
 			}
+		case now := <-watchdog.C:
+			s.checkStalledTurns(now)
 		}
 		s.armIdle(idle)
 	}
@@ -206,6 +219,10 @@ func (s *Supervisor) fromClient(line []byte) error {
 			return s.replyError(env.ID, acp.CodeInternalError, "agy-acp-muzzle: kernel unavailable: "+err.Error())
 		}
 	}
+	if env.Method == "session/prompt" {
+		s.startTurn(id, sessionIDOf(env.Params))
+		s.lastKernelOutput = time.Now() // waiting for the kernel from now
+	}
 	s.track(env, d.Forward)
 	s.inflightClient[id] = env.Method
 	return s.toKernel(d.Forward)
@@ -231,10 +248,15 @@ func (s *Supervisor) track(env *acp.Envelope, forwarded []byte) {
 
 func (s *Supervisor) fromKernel(line []byte) error {
 	env, err := acp.Parse(line)
+	s.lastKernelOutput = time.Now()
 	if err == nil && env.Kind() == acp.KindResponse {
 		id := string(env.ID)
 		if strings.HasPrefix(id, `"`+svIDPrefix) {
 			return nil // late answer to a timed-out restore request
+		}
+		var drop bool
+		if line, drop = s.finishTurn(env, line); drop {
+			return nil // already failed by the watchdog
 		}
 		method := s.inflightClient[id]
 		delete(s.inflightClient, id)
@@ -252,6 +274,7 @@ func (s *Supervisor) fromKernel(line []byte) error {
 			}
 		}
 	} else if err == nil {
+		s.observeUpdate(env)
 		// Kernel requests and notifications name kernel session ids; the
 		// client knows lazily created sessions by their placeholders.
 		if ph, ok := s.realToLazy[sessionIDOf(env.Params)]; ok {
@@ -428,6 +451,7 @@ func (s *Supervisor) stopKernel(reason string) {
 }
 
 func (s *Supervisor) reset() {
+	clear(s.turns)
 	s.releaseFill() // a kernel that died cannot fill the cache
 	s.k = nil
 	clear(s.inflightClient)

@@ -189,6 +189,20 @@ Run with `cmd/acp-smoke` through the muzzle, in a Kubernetes pod on Linux
     prompt in a lazy session took 8.5 s (kernel start plus 1.8 s session
     creation). A placeholder loaded in a fresh process recalled the earlier
     turn.
+- **Storage:** kernel start time is dominated by reading about 350 MiB of
+  kernel and about 40 MiB of harness files. From a Longhorn PVC (30.8 MB/s,
+  half of the reads served by a remote replica) that was 10 s for
+  `initialize` and 8 s for session creation. From node-local disk
+  (2.8 GB/s) the first session took 2.9 s and a further lazy session
+  484 ms. Ship the kernel in the image, not on a PVC.
+- **Turn guards:** the kernel reports some failures as assistant text
+  ("Agent execution error: …") followed by a successful `end_turn`.
+  `--turn-guard` (default on) turns those, and turns with no output at all,
+  into JSON-RPC errors (`-32003`). Measured: a locked hostile prompt's turn
+  now fails visibly, and the next prompt in the session works.
+  `--turn-timeout` (default 10 min) fails and cancels a turn whose kernel
+  is silent that long. It doesn't fire while the kernel waits on the client
+  (e.g. a permission prompt).
 - **Workspace pollution:** in open mode the kernel writes
   `skills/system/run-workflow/SKILL.md` into the session cwd (follow-up).
 

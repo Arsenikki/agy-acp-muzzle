@@ -53,6 +53,8 @@ func run(args []string) int {
 	fs.Var(&sb.readWrite, "sandbox-rw", "extra paths the locked kernel may write")
 	fs.Var(&sb.ports, "sandbox-port", "TCP ports the locked kernel may connect to (default 443)")
 	verbose := fs.Bool("v", truthy(os.Getenv("AGY_ACP_MUZZLE_DEBUG")), "debug logging, incl. every client request's method (default from $AGY_ACP_MUZZLE_DEBUG)")
+	turnGuard := fs.Bool("turn-guard", true, "fail turns that end in a kernel error text or without any output")
+	turnTimeout := fs.Duration("turn-timeout", envDuration("AGY_ACP_MUZZLE_TURN_TIMEOUT", 10*time.Minute), "fail and cancel a turn whose kernel produces no output for this long (0 disables)")
 	noCache := fs.Bool("no-cache", false, "always start the kernel for initialize and session/new (no probe fast path)")
 	idle := fs.Duration("idle-timeout", envDuration("AGY_ACP_MUZZLE_IDLE_TIMEOUT", 3*time.Minute), "stop the kernel after this long with nothing in flight; the next request restores it (0 disables)")
 	logFile := fs.String("log-file", os.Getenv("AGY_ACP_MUZZLE_LOG_FILE"), "append logs to this file instead of stderr (clients often discard stderr)")
@@ -89,7 +91,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, cache: !*noCache, stdin: os.Stdin, stdout: os.Stdout}
+	o := options{argv: argv, locked: *locked, tmpBase: *tmpBase, sandbox: sb, idleTimeout: *idle, turnGuard: *turnGuard, turnTimeout: *turnTimeout, cache: !*noCache, stdin: os.Stdin, stdout: os.Stdout}
 	if o.srcHome, err = sourceGeminiHome(); err != nil {
 		log.Error("cannot resolve the Gemini home", "err", err)
 		return 1
@@ -130,6 +132,8 @@ type options struct {
 	sandbox     sandboxConfig
 	idleTimeout time.Duration // stop an idle kernel after this long (0: never)
 	cache       bool          // answer probes from the kernel's cached answers
+	turnGuard   bool          // fail kernel-error and empty turns
+	turnTimeout time.Duration // fail a turn after this long without kernel output
 	stdin       io.Reader     // client -> muzzle
 	stdout      io.Writer     // muzzle -> client
 }
@@ -202,6 +206,8 @@ func serve(log *slog.Logger, o options) (int, error) {
 		FromClient:  r.FromClient,
 		FromKernel:  r.FromKernel,
 		IdleTimeout: o.idleTimeout,
+		TurnGuard:   o.turnGuard,
+		TurnTimeout: o.turnTimeout,
 		Log:         log,
 	}
 	if o.cache {

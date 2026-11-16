@@ -61,8 +61,21 @@ func (f *fakeKernels) start() (*Process, error) {
 				update("replayed history")
 				reply(map[string]any{})
 			case "session/prompt":
-				update("hi")
-				reply(map[string]any{"stopReason": "end_turn"})
+				switch promptText(m) {
+				case "kernel-error":
+					update("Agent execution error: model output error: boom")
+					reply(map[string]any{"stopReason": "end_turn"})
+				case "empty":
+					reply(map[string]any{"stopReason": "end_turn"})
+				case "hang":
+					// never answers
+				case "ask":
+					askID = id
+					send(map[string]any{"jsonrpc": "2.0", "id": "k1", "method": "session/request_permission", "params": map[string]any{"sessionId": "s1"}})
+				default:
+					update("hi")
+					reply(map[string]any{"stopReason": "end_turn"})
+				}
 			case "ask":
 				// Ask the client and answer only once it replies.
 				askID = id
@@ -72,7 +85,8 @@ func (f *fakeKernels) start() (*Process, error) {
 			case nil:
 				// a response from the client
 				if m["id"] == "k1" && askID != nil {
-					send(map[string]any{"jsonrpc": "2.0", "id": askID, "result": map[string]any{}})
+					update("done")
+					send(map[string]any{"jsonrpc": "2.0", "id": askID, "result": map[string]any{"stopReason": "end_turn"}})
 					askID = nil
 				}
 			default:
@@ -536,5 +550,116 @@ func TestColdCacheFilledOnce(t *testing.T) {
 	placeholderOf(t, r)
 	if started, _ := f.counts(); started != 1 {
 		t.Fatalf("started %d kernels for a cold cache, want 1", started)
+	}
+}
+
+func promptText(m map[string]any) string {
+	params, _ := m["params"].(map[string]any)
+	blocks, _ := params["prompt"].([]any)
+	if len(blocks) == 0 {
+		return ""
+	}
+	b, _ := blocks[0].(map[string]any)
+	s, _ := b["text"].(string)
+	return s
+}
+
+func runWith(t *testing.T, f *fakeKernels, configure func(*Supervisor)) *testClient {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	c := &testClient{t: t, in: inW, out: make(chan string, 64), done: make(chan error, 1)}
+	go func() {
+		sc := bufio.NewScanner(outR)
+		for sc.Scan() {
+			c.out <- sc.Text()
+		}
+		close(c.out)
+	}()
+	s := &Supervisor{ClientIn: inR, ClientOut: outW, Start: f.start, RestoreTimeout: 5 * time.Second}
+	configure(s)
+	go func() {
+		c.done <- s.Run()
+		outW.Close()
+	}()
+	t.Cleanup(func() { inW.Close() })
+	return c
+}
+
+func prompt(id int, text string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":%q}]}}`, id, text)
+}
+
+func openSession(c *testClient) {
+	c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	c.response(1)
+	c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+	c.response(2)
+}
+
+func TestTurnGuard(t *testing.T) {
+	cases := []struct {
+		text     string
+		guard    bool
+		wantFail bool
+	}{
+		{"hello", true, false},
+		{"kernel-error", true, true},
+		{"empty", true, true},
+		{"kernel-error", false, false},
+		{"empty", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/guard=%v", tc.text, tc.guard), func(t *testing.T) {
+			f := &fakeKernels{}
+			c := runWith(t, f, func(s *Supervisor) { s.TurnGuard = tc.guard })
+			openSession(c)
+			c.send(prompt(3, tc.text))
+			r, _ := c.response(3)
+			failed := r["error"] != nil
+			if failed != tc.wantFail {
+				t.Fatalf("failed=%v, want %v: %v", failed, tc.wantFail, r)
+			}
+			if failed && r["error"].(map[string]any)["code"] != float64(CodeTurnFailed) {
+				t.Fatalf("error code: %v", r)
+			}
+		})
+	}
+}
+
+func TestWatchdogFailsSilentTurn(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) { s.TurnTimeout = 100 * time.Millisecond })
+	openSession(c)
+	start := time.Now()
+	c.send(prompt(3, "hang"))
+	r, _ := c.response(3)
+	if r["error"] == nil {
+		t.Fatalf("silent turn: %v", r)
+	}
+	if took := time.Since(start); took < 100*time.Millisecond {
+		t.Fatalf("failed after %s, before the timeout", took)
+	}
+	waitFor(t, func() bool {
+		return fmt.Sprint(f.methods(0)) == "[initialize session/new session/prompt session/cancel]"
+	})
+}
+
+func TestWatchdogWaitsWhileKernelAsksClient(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) { s.TurnTimeout = 50 * time.Millisecond; s.TurnGuard = true })
+	openSession(c)
+	c.send(prompt(3, "ask"))
+	if req := c.next(); req["id"] != "k1" {
+		t.Fatalf("want the permission request, got %v", req)
+	}
+	select {
+	case line := <-c.out:
+		t.Fatalf("watchdog fired while the client was deciding: %s", line)
+	case <-time.After(300 * time.Millisecond):
+	}
+	c.send(`{"jsonrpc":"2.0","id":"k1","result":{"outcome":{"outcome":"cancelled"}}}`)
+	if r, _ := c.response(3); r["result"] == nil {
+		t.Fatalf("turn after the client answered: %v", r)
 	}
 }
