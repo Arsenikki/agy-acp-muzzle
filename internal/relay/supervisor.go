@@ -64,6 +64,7 @@ type Supervisor struct {
 	realToLazy       map[string]string       // kernel session id -> placeholder
 	turns            map[string]*turn        // prompt request id -> turn
 	lastKernelOutput time.Time
+	blockedBy        string // last logged reason the kernel could not idle
 
 	toClient *lineWriter
 	k        *kernelConn
@@ -148,7 +149,11 @@ func (s *Supervisor) Run() error {
 				s.stopKernel("idle")
 			}
 		case now := <-watchdog.C:
-			s.checkStalledTurns(now)
+			// A tick is not activity: re-arming the idle timer on every
+			// tick would postpone idle shutdown forever.
+			if !s.checkStalledTurns(now) {
+				continue
+			}
 		}
 		s.armIdle(idle)
 	}
@@ -162,6 +167,15 @@ func (s *Supervisor) armIdle(t *time.Timer) {
 	t.Stop()
 	if s.IdleTimeout > 0 && s.idle() {
 		t.Reset(s.IdleTimeout)
+		s.blockedBy = ""
+		return
+	}
+	if s.k != nil && s.IdleTimeout > 0 {
+		// Say once per change what keeps the kernel from idling.
+		if why := fmt.Sprintf("client=%v kernel=%v", s.inflightClient, s.inflightKernel); why != s.blockedBy {
+			s.blockedBy = why
+			s.Log.Debug("idle blocked", "inflight", why)
+		}
 	}
 }
 
@@ -195,6 +209,8 @@ func (s *Supervisor) fromClient(line []byte) error {
 	id := string(env.ID)
 	switch env.Kind() {
 	case acp.KindResponse:
+		_, known := s.inflightKernel[id]
+		s.Log.Debug("client response", "id", id, "matched", known)
 		delete(s.inflightKernel, id)
 		if s.k == nil {
 			return nil // answers a kernel that has since been stopped
@@ -296,6 +312,7 @@ func (s *Supervisor) fromKernel(line []byte) error {
 	}
 	if fe, err := acp.Parse(d.Forward); err == nil && fe.Kind() == acp.KindRequest {
 		s.inflightKernel[string(fe.ID)] = true
+		s.Log.Debug("kernel request", "method", fe.Method, "id", string(fe.ID))
 	}
 	return s.toClient.WriteLine(d.Forward)
 }

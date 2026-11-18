@@ -685,3 +685,15 @@ func TestLargeLinesPassIntact(t *testing.T) {
 		t.Fatalf("kernel saw a %v-byte prompt, want %d", got, len(text))
 	}
 }
+
+func TestIdleStopNotPostponedByWatchdogTicks(t *testing.T) {
+	// The watchdog ticks every 10ms here; the idle timer (150ms) must still
+	// fire. Re-arming it on every tick postponed idle shutdown forever.
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) {
+		s.IdleTimeout = 150 * time.Millisecond
+		s.TurnTimeout = 40 * time.Millisecond
+	})
+	openSession(c)
+	waitFor(t, func() bool { _, stopped := f.counts(); return stopped == 1 })
+}
