@@ -109,25 +109,28 @@ func (s *Supervisor) finishTurn(env *acp.Envelope, line []byte) ([]byte, bool) {
 
 // checkStalledTurns fails turns whose kernel has produced no output for
 // TurnTimeout while nothing waits on the client, and cancels them in the
-// kernel. Their late answers are dropped.
-func (s *Supervisor) checkStalledTurns(now time.Time) {
+// kernel. Their late answers are dropped. It reports whether it failed any.
+func (s *Supervisor) checkStalledTurns(now time.Time) bool {
 	if s.TurnTimeout <= 0 || s.k == nil || len(s.inflightKernel) > 0 {
-		return
+		return false
 	}
 	if now.Sub(s.lastKernelOutput) < s.TurnTimeout {
-		return
+		return false
 	}
+	failed := false
 	for id, t := range s.turns {
 		if t.answered {
 			continue
 		}
 		t.answered = true
+		failed = true
 		delete(s.inflightClient, id)
 		s.Log.Warn("turn timed out", "session", t.session, "silentFor", now.Sub(s.lastKernelOutput).Round(time.Second))
 		cancel, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": "session/cancel", "params": map[string]string{"sessionId": t.session}})
 		_ = s.toKernel(cancel)
 		_ = s.replyError(json.RawMessage(id), CodeTurnFailed, "agy-acp-muzzle: turn timed out: no output from the kernel for "+s.TurnTimeout.String())
 	}
+	return failed
 }
 
 // watchdogInterval is how often stalled turns are checked.
