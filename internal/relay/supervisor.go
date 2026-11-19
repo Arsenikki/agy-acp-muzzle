@@ -66,6 +66,13 @@ type Supervisor struct {
 	lastKernelOutput time.Time
 	blockedBy        string // last logged reason the kernel could not idle
 
+	clientCh     chan []byte
+	clientClosed bool                 // client input ended while the loop was blocked
+	backlog      [][]byte             // client lines read while the loop was blocked
+	trigger      *trigger             // client request being handled (see cancel.go)
+	draining     map[string]time.Time // kernel session -> cancelled turn not yet over
+	held         map[string][][]byte  // kernel session -> prompts waiting for the drain
+
 	toClient *lineWriter
 	k        *kernelConn
 	seq      int
@@ -112,9 +119,11 @@ func (s *Supervisor) Run() error {
 	s.lazy = map[string]*lazySession{}
 	s.realToLazy = map[string]string{}
 	s.turns = map[string]*turn{}
+	s.draining = map[string]time.Time{}
+	s.held = map[string][][]byte{}
 
-	clientCh := make(chan []byte)
-	go readLines(s.ClientIn, clientCh, nil)
+	s.clientCh = make(chan []byte)
+	go readLines(s.ClientIn, s.clientCh, nil)
 
 	idle := time.NewTimer(time.Hour)
 	idle.Stop()
@@ -124,12 +133,25 @@ func (s *Supervisor) Run() error {
 	defer s.releaseFill()
 
 	for {
+		// Client lines queued while the loop was blocked come first, in order.
+		if len(s.backlog) > 0 {
+			line := s.backlog[0]
+			s.backlog = s.backlog[1:]
+			if err := s.fromClient(line); err != nil {
+				return err
+			}
+			s.armIdle(idle)
+			continue
+		}
+		if s.clientClosed {
+			return nil
+		}
 		var kernelLines chan []byte
 		if s.k != nil {
 			kernelLines = s.k.lines
 		}
 		select {
-		case line, ok := <-clientCh:
+		case line, ok := <-s.clientCh:
 			if !ok {
 				return nil
 			}
@@ -151,7 +173,8 @@ func (s *Supervisor) Run() error {
 		case now := <-watchdog.C:
 			// A tick is not activity: re-arming the idle timer on every
 			// tick would postpone idle shutdown forever.
-			if !s.checkStalledTurns(now) {
+			stalled := s.checkStalledTurns(now)
+			if expired := s.expireDrains(now); !stalled && !expired {
 				continue
 			}
 		}
@@ -200,9 +223,13 @@ func (s *Supervisor) fromClient(line []byte) error {
 		if handled, err := s.answerFromCache(env, d.Forward); handled {
 			return err
 		}
+		// While this request is handled the loop may block (lazy session,
+		// restore); a cancel for it is answered meanwhile (see cancel.go).
+		s.trigger = &trigger{id: env.ID, method: env.Method, session: sessionIDOf(env.Params)}
+		defer func() { s.trigger = nil }()
 	}
 	forward, env, skip, err := s.mapToKernel(env, d.Forward)
-	if skip || err != nil {
+	if skip || err != nil || s.trigger.isCancelled() {
 		return err
 	}
 	d.Forward = forward
@@ -217,6 +244,9 @@ func (s *Supervisor) fromClient(line []byte) error {
 		}
 		return s.toKernel(d.Forward)
 	case acp.KindNotification:
+		if env.Method == "session/cancel" {
+			s.cancelTurns(sessionIDOf(env.Params))
+		}
 		if s.k == nil {
 			return nil // e.g. session/cancel: nothing is running
 		}
@@ -234,6 +264,12 @@ func (s *Supervisor) fromClient(line []byte) error {
 			s.Log.Error("kernel unavailable", "err", err)
 			return s.replyError(env.ID, acp.CodeInternalError, "agy-acp-muzzle: kernel unavailable: "+err.Error())
 		}
+		if s.trigger.isCancelled() {
+			return nil
+		}
+	}
+	if env.Method == "session/prompt" && s.holdPrompt(env, d.Forward) {
+		return nil
 	}
 	if env.Method == "session/prompt" {
 		s.startTurn(id, sessionIDOf(env.Params))
@@ -265,6 +301,9 @@ func (s *Supervisor) track(env *acp.Envelope, forwarded []byte) {
 func (s *Supervisor) fromKernel(line []byte) error {
 	env, err := acp.Parse(line)
 	s.lastKernelOutput = time.Now()
+	if err == nil && env.Kind() != acp.KindResponse && s.drainingLine(env) {
+		return nil // belongs to a turn the client already saw cancelled
+	}
 	if err == nil && env.Kind() == acp.KindResponse {
 		id := string(env.ID)
 		if strings.HasPrefix(id, `"`+svIDPrefix) {
@@ -415,7 +454,18 @@ func (s *Supervisor) call(req []byte, passthrough bool) (json.RawMessage, error)
 	want, _ := json.Marshal(id)
 	deadline := time.After(s.RestoreTimeout)
 	for {
+		// Keep reading the client meanwhile: a cancel must be answered fast.
+		var clientCh chan []byte
+		if !s.clientClosed {
+			clientCh = s.clientCh
+		}
 		select {
+		case line, ok := <-clientCh:
+			if !ok {
+				s.clientClosed = true
+				continue
+			}
+			s.readClient(line)
 		case line, ok := <-s.k.lines:
 			if !ok {
 				return nil, errors.New("kernel exited")
@@ -468,6 +518,8 @@ func (s *Supervisor) stopKernel(reason string) {
 }
 
 func (s *Supervisor) reset() {
+	clear(s.draining)
+	clear(s.held)
 	clear(s.turns)
 	s.releaseFill() // a kernel that died cannot fill the cache
 	s.k = nil
