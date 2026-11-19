@@ -116,7 +116,8 @@ func (s *Supervisor) Run() error {
 	if s.RestoreTimeout == 0 {
 		s.RestoreTimeout = 2 * time.Minute
 	}
-	s.toClient = &lineWriter{w: s.ClientOut}
+	s.toClient = newLineWriter(s.ClientOut)
+	defer s.toClient.Close(5 * time.Second) // runs last: flush the final answers
 	s.sessions = map[string]*sessionRec{}
 	s.pending = map[string]pendingSession{}
 	s.inflightClient = map[string]string{}
