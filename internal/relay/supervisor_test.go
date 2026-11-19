@@ -14,10 +14,11 @@ import (
 
 // fakeKernels starts in-process kernels and records what each one received.
 type fakeKernels struct {
-	mu       sync.Mutex
-	started  int
-	stopped  int
-	received [][]map[string]any // per kernel instance, the messages received
+	mu        sync.Mutex
+	started   int
+	stopped   int
+	received  [][]map[string]any // per kernel instance, the messages received
+	initDelay time.Duration      // delay before answering initialize (a slow kernel start)
 }
 
 func (f *fakeKernels) start() (*Process, error) {
@@ -35,11 +36,15 @@ func (f *fakeKernels) start() (*Process, error) {
 		defer outW.Close()
 		sc := bufio.NewScanner(inR)
 		sc.Buffer(make([]byte, 64<<10), 64<<20)
+		var sendMu sync.Mutex
 		send := func(v any) {
 			b, _ := json.Marshal(v)
+			sendMu.Lock()
 			fmt.Fprintf(outW, "%s\n", b)
+			sendMu.Unlock()
 		}
 		var askID any
+		var slowID any // a "slow-cancel" prompt waiting for session/cancel
 		for sc.Scan() {
 			var m map[string]any
 			if json.Unmarshal(sc.Bytes(), &m) != nil {
@@ -56,6 +61,21 @@ func (f *fakeKernels) start() (*Process, error) {
 				}})
 			}
 			switch m["method"] {
+			case "initialize":
+				time.Sleep(f.initDelay)
+				reply(map[string]any{})
+			case "session/cancel":
+				// Like the real kernel, take a while, emit a late update and
+				// answer the cancelled prompt with an error.
+				if slowID != nil {
+					pid := slowID
+					slowID = nil
+					go func() {
+						time.Sleep(300 * time.Millisecond)
+						update("late chunk of the cancelled turn")
+						send(map[string]any{"jsonrpc": "2.0", "id": pid, "error": map[string]any{"code": -32603, "message": "The request was cancelled by the client."}})
+					}()
+				}
 			case "session/new":
 				reply(map[string]any{"sessionId": "s1"})
 			case "session/load":
@@ -73,6 +93,10 @@ func (f *fakeKernels) start() (*Process, error) {
 					reply(map[string]any{"stopReason": "end_turn"})
 				case "empty":
 					reply(map[string]any{"stopReason": "end_turn"})
+				case "slow-cancel":
+					slowID = id
+				case "self-cancel":
+					send(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32603, "message": "Internal error", "data": map[string]any{"details": "The request was cancelled by the client."}}})
 				case "hang":
 					// never answers
 				case "ask":
@@ -696,4 +720,111 @@ func TestIdleStopNotPostponedByWatchdogTicks(t *testing.T) {
 	})
 	openSession(c)
 	waitFor(t, func() bool { _, stopped := f.counts(); return stopped == 1 })
+}
+
+func cancelLine(session string) string {
+	return `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"` + session + `"}}`
+}
+
+func TestCancelAnsweredAtOnceAndNextPromptHeld(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) { s.TurnGuard = true })
+	openSession(c)
+	c.send(prompt(3, "slow-cancel"))
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	c.send(cancelLine("s1"))
+	r, _ := c.response(3)
+	if took := time.Since(start); took > 150*time.Millisecond {
+		t.Fatalf("cancel answered after %s; clients give up after ~2s and the kernel takes longer", took)
+	}
+	if r["result"].(map[string]any)["stopReason"] != "cancelled" {
+		t.Fatalf("cancelled prompt: %v", r)
+	}
+
+	// The next prompt goes in right away (as Paseo does) and is held until
+	// the kernel has finished the cancelled turn; none of that turn's late
+	// output may reach the client.
+	c.send(prompt(4, "hello"))
+	r, notes := c.response(4)
+	if r["result"] == nil {
+		t.Fatalf("prompt after cancel: %v", r)
+	}
+	for _, n := range notes {
+		if strings.Contains(fmt.Sprint(n), "late chunk") || n["id"] == float64(3) {
+			t.Fatalf("output of the cancelled turn leaked: %v", n)
+		}
+	}
+	methods := f.methods(0)
+	if got := fmt.Sprint(methods[len(methods)-3:]); got != "[session/prompt session/cancel session/prompt]" {
+		t.Fatalf("kernel saw %v", methods)
+	}
+}
+
+func TestCancelDuringRestoreNeverReachesKernel(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) { s.IdleTimeout = 50 * time.Millisecond })
+	openSession(c)
+	waitFor(t, func() bool { _, stopped := f.counts(); return stopped == 1 })
+
+	f.mu.Lock()
+	f.initDelay = 500 * time.Millisecond // the restore blocks for a while
+	f.mu.Unlock()
+	c.send(prompt(3, "hello"))
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	c.send(cancelLine("s1"))
+	r, _ := c.response(3)
+	if took := time.Since(start); took > 150*time.Millisecond {
+		t.Fatalf("cancel during restore answered after %s", took)
+	}
+	if r["result"].(map[string]any)["stopReason"] != "cancelled" {
+		t.Fatalf("cancelled prompt: %v", r)
+	}
+	// The connection still works, and the cancelled prompt never ran.
+	c.send(prompt(4, "hello"))
+	if r, _ := c.response(4); r["result"] == nil {
+		t.Fatalf("prompt after cancel: %v", r)
+	}
+	prompts := 0
+	for _, m := range f.methods(1) {
+		if m == "session/prompt" {
+			prompts++
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("restored kernel ran %d prompts, want only the second (%v)", prompts, f.methods(1))
+	}
+}
+
+func TestKernelCancellationErrorBecomesStopReason(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) { s.TurnGuard = true })
+	openSession(c)
+	c.send(prompt(3, "self-cancel"))
+	r, _ := c.response(3)
+	if r["error"] != nil || r["result"].(map[string]any)["stopReason"] != "cancelled" {
+		t.Fatalf("kernel cancellation error not mapped: %v", r)
+	}
+}
+
+func TestCancelHeldPrompt(t *testing.T) {
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) {})
+	openSession(c)
+	c.send(prompt(3, "slow-cancel"))
+	time.Sleep(50 * time.Millisecond)
+	c.send(cancelLine("s1"))
+	c.response(3)
+	c.send(prompt(4, "hello")) // held behind the cancelled turn
+	c.send(cancelLine("s1"))   // the client cancels that one too
+	r, _ := c.response(4)
+	if r["result"].(map[string]any)["stopReason"] != "cancelled" {
+		t.Fatalf("held prompt: %v", r)
+	}
+	time.Sleep(500 * time.Millisecond) // the kernel finishes the first turn
+	if n := strings.Count(fmt.Sprint(f.methods(0)), "session/prompt"); n != 1 {
+		t.Fatalf("cancelled held prompt reached the kernel: %v", f.methods(0))
+	}
 }

@@ -37,6 +37,9 @@ type message struct {
 	Error   json.RawMessage `json:"error,omitempty"`
 }
 
+// cancelAfter, if set, cancels the first prompt this long after it starts.
+var cancelAfter time.Duration
+
 func main() { os.Exit(run()) }
 
 func run() int {
@@ -50,6 +53,7 @@ func run() int {
 	authMethod := flag.String("authenticate", "", "call authenticate with this methodId after initialize (e.g. oauth-personal)")
 	sessions := flag.Int("sessions", 1, "number of sessions to create on the one connection (each gets every prompt)")
 	pause := flag.Duration("pause", 0, "wait this long before each prompt after the first")
+	flag.DurationVar(&cancelAfter, "cancel-after", 0, "send session/cancel this long after the first prompt starts (tests cancellation)")
 	hold := flag.Duration("hold", 0, "keep the agent running this long after the last turn (for inspection)")
 	raw := flag.Bool("raw", false, "print every raw line received")
 	flag.Parse()
@@ -144,6 +148,13 @@ func (c *conn) session(cwd, model, load string, prompts []string, pause time.Dur
 		if i > 0 && pause > 0 {
 			c.logf("pausing %s", pause)
 			time.Sleep(pause)
+		}
+		if cancelAfter > 0 && i == 0 {
+			go func(sid string) {
+				time.Sleep(cancelAfter)
+				c.logf("-> session/cancel")
+				c.send(map[string]any{"jsonrpc": "2.0", "method": "session/cancel", "params": map[string]string{"sessionId": sid}})
+			}(sessionID)
 		}
 		c.resetText()
 		res, err := c.call("session/prompt", map[string]any{

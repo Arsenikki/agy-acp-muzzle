@@ -77,7 +77,16 @@ func (s *Supervisor) finishTurn(env *acp.Envelope, line []byte) ([]byte, bool) {
 	}
 	delete(s.turns, id)
 	if t.answered {
+		// Already answered (cancelled or timed out): the kernel is done with
+		// the turn now, so a prompt held behind it may go.
+		s.endDrain(t.session)
 		return nil, true
+	}
+	if len(env.Error) > 0 && isKernelCancellation(env.Error) {
+		// ACP wants stopReason "cancelled", not an error.
+		if out, err := acp.ResultResponse(env.ID, json.RawMessage(`{"stopReason":"cancelled"}`)); err == nil {
+			return out, false
+		}
 	}
 	if !s.TurnGuard || len(env.Error) > 0 {
 		return line, false
@@ -133,10 +142,10 @@ func (s *Supervisor) checkStalledTurns(now time.Time) bool {
 	return failed
 }
 
-// watchdogInterval is how often stalled turns are checked.
+// watchdogInterval is how often stalled turns and drains are checked.
 func watchdogInterval(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
-		return time.Hour // effectively off; checkStalledTurns ignores it
+		return 15 * time.Second // still expires drains; checkStalledTurns ignores it
 	}
 	return min(max(timeout/4, 10*time.Millisecond), 15*time.Second)
 }
