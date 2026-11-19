@@ -60,6 +60,7 @@ func run(args []string) int {
 	noCache := fs.Bool("no-cache", false, "always start the kernel for initialize and session/new (no probe fast path)")
 	idle := fs.Duration("idle-timeout", envDuration("AGY_ACP_MUZZLE_IDLE_TIMEOUT", 3*time.Minute), "stop the kernel after this long with nothing in flight; the next request restores it (0 disables)")
 	logFile := fs.String("log-file", os.Getenv("AGY_ACP_MUZZLE_LOG_FILE"), "append logs to this file instead of stderr (clients often discard stderr)")
+	login := fs.Bool("login", false, "log the kernel in interactively (consumer OAuth) on a headless machine, then exit")
 	showVersion := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -98,6 +99,13 @@ func run(args []string) int {
 	if o.srcHome, err = sourceGeminiHome(); err != nil {
 		log.Error("cannot resolve the Gemini home", "err", err)
 		return 1
+	}
+	if *login {
+		if err := runLogin(log, argv, o.srcHome, os.Stdin, os.Stderr); err != nil {
+			log.Error("login failed", "err", err)
+			return 1
+		}
+		return 0
 	}
 	code, err := serve(log, o)
 	if err != nil {
@@ -191,7 +199,7 @@ func serve(log *slog.Logger, o options) (int, error) {
 		r.FromClient = (&policy.Open{DisabledTools: o.disabledTools}).FromClient
 	}
 	start := func() (*relay.Process, error) {
-		return startKernel(log, argv, filepath.Dir(o.argv[0]), kernelEnv)
+		return startKernel(log, argv, filepath.Dir(o.argv[0]), kernelEnv, os.Stderr)
 	}
 
 	// The supervisor ends when the client's input ends; a termination
