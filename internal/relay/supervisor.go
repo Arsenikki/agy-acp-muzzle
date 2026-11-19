@@ -100,8 +100,13 @@ type pendingSession struct {
 type kernelConn struct {
 	proc  *Process
 	lines chan []byte // closed when the kernel's output ends
+	out   chan []byte // lines for the kernel, written by writeLines
 	done  chan struct{}
 }
+
+// kernelQueue is how many lines may wait for the kernel to read its stdin
+// before the main loop blocks.
+const kernelQueue = 4096
 
 // Run serves the client until its input ends.
 func (s *Supervisor) Run() error {
@@ -241,6 +246,8 @@ func (s *Supervisor) fromClient(line []byte) error {
 		_, known := s.inflightKernel[id]
 		s.Log.Debug("client response", "id", id, "matched", known)
 		delete(s.inflightKernel, id)
+		// The kernel was waiting on the client; its silence starts now.
+		s.lastKernelOutput = time.Now()
 		if s.k == nil {
 			return nil // answers a kernel that has since been stopped
 		}
@@ -392,8 +399,9 @@ func (s *Supervisor) startKernel(restore bool) error {
 	if err != nil {
 		return err
 	}
-	k := &kernelConn{proc: proc, lines: make(chan []byte), done: make(chan struct{})}
+	k := &kernelConn{proc: proc, lines: make(chan []byte), out: make(chan []byte, kernelQueue), done: make(chan struct{})}
 	go readLines(proc.Stdout, k.lines, k.done)
+	go s.writeLines(k)
 	s.k = k
 	if !restore || s.init == nil {
 		return nil
@@ -530,16 +538,34 @@ func (s *Supervisor) reset() {
 	clear(s.pending)
 }
 
+// toKernel queues a line for the kernel. Writing happens in writeLines, so the
+// main loop never blocks on the kernel's stdin while the kernel may itself be
+// blocked writing output only the main loop reads.
 func (s *Supervisor) toKernel(line []byte) error {
 	if s.k == nil {
 		return nil
 	}
 	buf := make([]byte, 0, len(line)+1)
-	if _, err := s.k.proc.Stdin.Write(append(append(buf, line...), '\n')); err != nil {
-		// The exit is noticed when its output ends; don't fail the client.
-		s.Log.Debug("write to kernel failed", "err", err)
+	select {
+	case s.k.out <- append(append(buf, line...), '\n'):
+	case <-s.k.done:
 	}
 	return nil
+}
+
+// writeLines writes queued lines to the kernel until it is stopped.
+func (s *Supervisor) writeLines(k *kernelConn) {
+	for {
+		select {
+		case line := <-k.out:
+			if _, err := k.proc.Stdin.Write(line); err != nil {
+				// The exit is noticed when its output ends; don't fail the client.
+				s.Log.Debug("write to kernel failed", "err", err)
+			}
+		case <-k.done:
+			return
+		}
+	}
 }
 
 func (s *Supervisor) replyError(id json.RawMessage, code int, msg string) error {

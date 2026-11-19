@@ -93,6 +93,11 @@ func (f *fakeKernels) start() (*Process, error) {
 					reply(map[string]any{"stopReason": "end_turn"})
 				case "empty":
 					reply(map[string]any{"stopReason": "end_turn"})
+				case "flood":
+					for i := range 200 {
+						update(fmt.Sprint("chunk ", i))
+					}
+					reply(map[string]any{"stopReason": "end_turn"})
 				case "slow-cancel":
 					slowID = id
 				case "self-cancel":
@@ -826,5 +831,26 @@ func TestCancelHeldPrompt(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // the kernel finishes the first turn
 	if n := strings.Count(fmt.Sprint(f.methods(0)), "session/prompt"); n != 1 {
 		t.Fatalf("cancelled held prompt reached the kernel: %v", f.methods(0))
+	}
+}
+
+func TestNoDeadlockWhenBothSidesWrite(t *testing.T) {
+	// The kernel floods output while the client sends a burst of requests.
+	// Writing to the kernel from the main loop deadlocked here: the loop
+	// blocked on the kernel's stdin while the kernel blocked on its stdout,
+	// which only the loop reads.
+	f := &fakeKernels{}
+	c := runWith(t, f, func(s *Supervisor) {})
+	openSession(c)
+	c.send(prompt(3, "flood"))
+	for i := range 50 {
+		c.send(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"default"}}`, 100+i))
+	}
+	seen := map[float64]bool{}
+	for len(seen) < 51 {
+		m := c.next()
+		if id, ok := m["id"].(float64); ok {
+			seen[id] = true
+		}
 	}
 }
