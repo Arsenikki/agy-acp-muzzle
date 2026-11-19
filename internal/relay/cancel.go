@@ -99,8 +99,7 @@ func (s *Supervisor) drainingLine(env *acp.Envelope) bool {
 
 // holdPrompt queues a prompt for a draining session. It reports whether it
 // did.
-func (s *Supervisor) holdPrompt(env *acp.Envelope, line []byte) bool {
-	session := sessionIDOf(env.Params)
+func (s *Supervisor) holdPrompt(env *acp.Envelope, line []byte, session string) bool {
 	if _, ok := s.draining[session]; !ok {
 		return false
 	}

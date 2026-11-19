@@ -219,16 +219,18 @@ func (s *Supervisor) fromClient(line []byte) error {
 	if err != nil {
 		return s.toKernel(d.Forward)
 	}
+	// Decode params.sessionId once: params can be megabytes (images).
+	sid := sessionIDOf(env.Params)
 	if env.Kind() == acp.KindRequest {
 		if handled, err := s.answerFromCache(env, d.Forward); handled {
 			return err
 		}
 		// While this request is handled the loop may block (lazy session,
 		// restore); a cancel for it is answered meanwhile (see cancel.go).
-		s.trigger = &trigger{id: env.ID, method: env.Method, session: sessionIDOf(env.Params)}
+		s.trigger = &trigger{id: env.ID, method: env.Method, session: sid}
 		defer func() { s.trigger = nil }()
 	}
-	forward, env, skip, err := s.mapToKernel(env, d.Forward)
+	forward, env, sid, skip, err := s.mapToKernel(env, d.Forward, sid)
 	if skip || err != nil || s.trigger.isCancelled() {
 		return err
 	}
@@ -245,7 +247,7 @@ func (s *Supervisor) fromClient(line []byte) error {
 		return s.toKernel(d.Forward)
 	case acp.KindNotification:
 		if env.Method == "session/cancel" {
-			s.cancelTurns(sessionIDOf(env.Params))
+			s.cancelTurns(sid)
 		}
 		if s.k == nil {
 			return nil // e.g. session/cancel: nothing is running
@@ -268,11 +270,11 @@ func (s *Supervisor) fromClient(line []byte) error {
 			return nil
 		}
 	}
-	if env.Method == "session/prompt" && s.holdPrompt(env, d.Forward) {
+	if env.Method == "session/prompt" && s.holdPrompt(env, d.Forward, sid) {
 		return nil
 	}
 	if env.Method == "session/prompt" {
-		s.startTurn(id, sessionIDOf(env.Params))
+		s.startTurn(id, sid)
 		s.lastKernelOutput = time.Now() // waiting for the kernel from now
 	}
 	s.track(env, d.Forward)
@@ -593,9 +595,9 @@ func (s *Supervisor) answerFromCache(env *acp.Envelope, forwarded []byte) (bool,
 
 // mapToKernel rewrites a client message naming a placeholder session to the
 // kernel's session id, creating the kernel session on first use. skip means
-// the message was fully handled (dropped or answered).
-func (s *Supervisor) mapToKernel(env *acp.Envelope, line []byte) ([]byte, *acp.Envelope, bool, error) {
-	ph := sessionIDOf(env.Params)
+// the message was fully handled (dropped or answered). ph is the message's
+// params.sessionId; the kernel session id is returned.
+func (s *Supervisor) mapToKernel(env *acp.Envelope, line []byte, ph string) ([]byte, *acp.Envelope, string, bool, error) {
 	ls, known := s.lazy[ph]
 	if !known && ph != "" && s.Sessions != nil {
 		// A placeholder from an earlier connection (e.g. before a restart).
@@ -606,26 +608,26 @@ func (s *Supervisor) mapToKernel(env *acp.Envelope, line []byte) ([]byte, *acp.E
 		}
 	}
 	if !known {
-		return line, env, false, nil
+		return line, env, ph, false, nil
 	}
 	if ls.real == "" {
 		switch {
 		case env.Kind() != acp.KindRequest:
-			return nil, env, true, nil // e.g. session/cancel: nothing started yet
+			return nil, env, ph, true, nil // e.g. session/cancel: nothing started yet
 		case env.Method == "session/load" || env.Method == "session/resume":
-			return nil, env, true, s.replyError(env.ID, -32002, "agy-acp-muzzle: session "+ph+" was never used")
+			return nil, env, ph, true, s.replyError(env.ID, -32002, "agy-acp-muzzle: session "+ph+" was never used")
 		}
 		if err := s.materialize(ph, ls); err != nil {
 			s.Log.Error("cannot create kernel session", "placeholder", ph, "err", err)
-			return nil, env, true, s.replyError(env.ID, acp.CodeInternalError, "agy-acp-muzzle: cannot create session: "+err.Error())
+			return nil, env, ph, true, s.replyError(env.ID, acp.CodeInternalError, "agy-acp-muzzle: cannot create session: "+err.Error())
 		}
 	}
 	line = withSessionID(line, ls.real)
 	mapped, err := acp.Parse(line)
 	if err != nil {
-		return line, env, false, nil
+		return line, env, ls.real, false, nil
 	}
-	return line, mapped, false, nil
+	return line, mapped, ls.real, false, nil
 }
 
 // materialize creates the kernel session behind a placeholder.
