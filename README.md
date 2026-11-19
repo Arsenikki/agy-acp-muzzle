@@ -62,7 +62,10 @@ yourself, under the [Antigravity terms](https://antigravity.google/terms).
    registry. Unpack the archive for your platform somewhere local and fast
    (a kernel start reads several hundred MiB, so avoid slow network storage).
 
-3. **Log in once** with the kernel's consumer OAuth login (`oauth-personal`).
+3. **Log in once** with the kernel's consumer OAuth login (`oauth-personal`):
+   `agy-acp-muzzle --login` prints the authorization link; open it anywhere,
+   sign in, and paste back the `http://localhost:...` address the browser ends
+   up on (it does not load; that is expected on a headless machine).
    Its credentials end up in `$GEMINI_HOME/antigravity-acp/acp_token.json`
    (`$GEMINI_HOME` defaults to `~/.gemini`). Clients that never call ACP
    `authenticate` (such as Paseo) also need the method in
@@ -112,6 +115,7 @@ A single run can then be locked with `paseo run --env AGY_LOCKDOWN=1 …`.
 | `--no-cache` | | off | always start the kernel for probes |
 | `--sandbox-exec`, `--sandbox-ro`, `--sandbox-rw`, `--sandbox-port` | | | extend the locked Landlock rules |
 | `--no-sandbox` | | off | locked mode without Landlock (debugging only) |
+| `--login` | | | log the kernel in (consumer OAuth) on a headless machine, then exit |
 | `--log-file`, `-v` | `AGY_ACP_MUZZLE_LOG_FILE`, `AGY_ACP_MUZZLE_DEBUG` | stderr, info | logging (many clients discard stderr) |
 
 Locked mode requires Landlock ABI 4 or newer (Linux 6.7+) and refuses to

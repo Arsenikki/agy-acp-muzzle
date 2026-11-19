@@ -7,9 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +114,23 @@ func fakeKernel(in io.Reader, out io.Writer) int {
 			child.Env = append(os.Environ(), orphanEnv+"=1")
 			_ = child.Start()
 			reply(map[string]any{"pid": child.Process.Pid})
+		case "authenticate":
+			// Like the kernel: print a link whose redirect_uri is a local
+			// server, and finish once the redirect arrives with a code.
+			l, _ := net.Listen("tcp", "127.0.0.1:0")
+			codes := make(chan string, 1)
+			go func() {
+				_ = http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					codes <- r.URL.Query().Get("code")
+				}))
+			}()
+			redirect := url.QueryEscape("http://localhost:" + strconv.Itoa(l.Addr().(*net.TCPAddr).Port) + "/")
+			fmt.Fprintf(os.Stderr, "some log line\nOpen the following link to authenticate the ACP server: https://accounts.example.test/auth?redirect_uri=%s&scope=x\n", redirect)
+			if code := <-codes; code == "good" {
+				reply(map[string]any{})
+			} else {
+				send(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32000, "message": "bad code " + code}})
+			}
 		case "session/new":
 			reply(map[string]any{"sessionId": "s1", "modes": map[string]any{"currentModeId": "default"}, "echo": msg.Params})
 		case "session/prompt":

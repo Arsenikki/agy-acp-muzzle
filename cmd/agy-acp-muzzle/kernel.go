@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -14,7 +15,7 @@ import (
 // startKernel starts one kernel process. It owns the pipe ends itself (rather
 // than exec's StdinPipe/StdoutPipe) so the process can be reaped as soon as it
 // exits without truncating output the relay has not read yet.
-func startKernel(log *slog.Logger, argv []string, dir string, env []string) (*relay.Process, error) {
+func startKernel(log *slog.Logger, argv []string, dir string, env []string, stderr io.Writer) (*relay.Process, error) {
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -30,7 +31,7 @@ func startKernel(log *slog.Logger, argv []string, dir string, env []string) (*re
 	cmd.Env = env
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = stderr
 	setKernelProcAttr(cmd)
 	err = cmd.Start()
 	stdinR.Close()
