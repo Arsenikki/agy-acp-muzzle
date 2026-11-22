@@ -54,6 +54,11 @@ type Supervisor struct {
 	TurnGuard   bool
 	TurnTimeout time.Duration
 
+	// HideModelVariants drops the kernel's flat per-thinking-level model list
+	// from results, leaving one model per family plus the thinking_level option
+	// (see models.go).
+	HideModelVariants bool
+
 	// Cache, if set, answers initialize and session/new without a kernel
 	// (see lazy.go); Sessions persists the placeholder ids it hands out.
 	Cache    Cache
@@ -338,6 +343,11 @@ func (s *Supervisor) fromKernel(line []byte) error {
 				}
 			}
 		}
+		// The cache above keeps the kernel's full answer; the client gets it
+		// without the flat model list.
+		if s.HideModelVariants && len(env.Result) > 0 {
+			line = lineWithoutModelList(line)
+		}
 	} else if err == nil {
 		s.observeUpdate(env)
 		// Kernel requests and notifications name kernel session ids; the
@@ -615,6 +625,9 @@ func (s *Supervisor) answerFromCache(env *acp.Envelope, forwarded []byte) (bool,
 		ph := newPlaceholder()
 		s.lazy[ph] = &lazySession{params: env.Params}
 		s.Log.Debug("session answered from cache", "placeholder", ph)
+		if s.HideModelVariants {
+			newResult = withoutModelList(newResult)
+		}
 		return true, s.replyResult(env.ID, withResultSessionID(newResult, ph))
 	}
 	return false, nil

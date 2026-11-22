@@ -77,7 +77,10 @@ func (f *fakeKernels) start() (*Process, error) {
 					}()
 				}
 			case "session/new":
-				reply(map[string]any{"sessionId": "s1"})
+				reply(map[string]any{"sessionId": "s1",
+					"models":        map[string]any{"currentModelId": "m-medium", "availableModels": []any{map[string]any{"modelId": "m-low"}, map[string]any{"modelId": "m-medium"}}},
+					"configOptions": []any{map[string]any{"id": "model", "currentValue": "m"}, map[string]any{"id": "thinking_level", "currentValue": "medium"}},
+				})
 			case "session/load":
 				update("replayed history")
 				reply(map[string]any{})
@@ -852,5 +855,36 @@ func TestNoDeadlockWhenBothSidesWrite(t *testing.T) {
 		if id, ok := m["id"].(float64); ok {
 			seen[id] = true
 		}
+	}
+}
+
+func TestHideModelVariants(t *testing.T) {
+	for _, hide := range []bool{true, false} {
+		t.Run(fmt.Sprint("hide=", hide), func(t *testing.T) {
+			f := &fakeKernels{}
+			cache := &memCache{}
+			c := runWith(t, f, func(s *Supervisor) { s.HideModelVariants = hide; s.Cache = cache })
+			c.send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+			c.response(1)
+			c.send(`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w"}}`)
+			r, _ := c.response(2)
+			_, hasModels := r["result"].(map[string]any)["models"]
+			if hasModels == hide {
+				t.Fatalf("models present=%v with hide=%v: %v", hasModels, hide, r)
+			}
+			if r["result"].(map[string]any)["configOptions"] == nil {
+				t.Fatalf("configOptions lost: %v", r)
+			}
+			// The cache keeps the kernel's full answer...
+			if _, sn := cache.Load(); !strings.Contains(string(sn), `"models"`) {
+				t.Fatalf("cache lost the model list: %s", sn)
+			}
+			// ...and answers from it are stripped the same way.
+			c.send(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"/w"}}`)
+			r, _ = c.response(3)
+			if _, has := r["result"].(map[string]any)["models"]; has == hide {
+				t.Fatalf("cached answer: models present=%v with hide=%v", has, hide)
+			}
+		})
 	}
 }
