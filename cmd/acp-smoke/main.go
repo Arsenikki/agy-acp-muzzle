@@ -40,6 +40,9 @@ type message struct {
 // cancelAfter, if set, cancels the first prompt this long after it starts.
 var cancelAfter time.Duration
 
+// setConfig holds session/set_config_option id=value pairs.
+var setConfig listFlag
+
 func main() { os.Exit(run()) }
 
 func run() int {
@@ -53,6 +56,7 @@ func run() int {
 	authMethod := flag.String("authenticate", "", "call authenticate with this methodId after initialize (e.g. oauth-personal)")
 	sessions := flag.Int("sessions", 1, "number of sessions to create on the one connection (each gets every prompt)")
 	pause := flag.Duration("pause", 0, "wait this long before each prompt after the first")
+	flag.Var(&setConfig, "set-config", "session/set_config_option id=value after session setup, e.g. thinking_level=high (repeatable); prints the resulting option values")
 	flag.DurationVar(&cancelAfter, "cancel-after", 0, "send session/cancel this long after the first prompt starts (tests cancellation)")
 	hold := flag.Duration("hold", 0, "keep the agent running this long after the last turn (for inspection)")
 	raw := flag.Bool("raw", false, "print every raw line received")
@@ -142,6 +146,14 @@ func (c *conn) session(cwd, model, load string, prompts []string, pause time.Dur
 		if _, err := c.call("session/set_model", map[string]any{"sessionId": sessionID, "modelId": model}); err != nil {
 			return c.fail("session/set_model", err)
 		}
+	}
+	for _, kv := range setConfig {
+		id, value, _ := strings.Cut(kv, "=")
+		res, err := c.call("session/set_config_option", map[string]any{"sessionId": sessionID, "configId": id, "value": value})
+		if err != nil {
+			return c.fail("session/set_config_option", err)
+		}
+		c.logf("config after %s: %s", kv, configSummary(res))
 	}
 	code := 0
 	for i, p := range prompts {
@@ -343,4 +355,21 @@ func (c *conn) notification(m message) {
 func mustGetwd() string {
 	wd, _ := os.Getwd()
 	return wd
+}
+
+// configSummary renders the current value of each config option in a
+// set_config_option result, e.g. "model=gemini-4-hydrogen thinking_level=high".
+func configSummary(res json.RawMessage) string {
+	var r struct {
+		ConfigOptions []struct {
+			ID           string `json:"id"`
+			CurrentValue any    `json:"currentValue"`
+		} `json:"configOptions"`
+	}
+	_ = json.Unmarshal(res, &r)
+	var parts []string
+	for _, o := range r.ConfigOptions {
+		parts = append(parts, fmt.Sprintf("%s=%v", o.ID, o.CurrentValue))
+	}
+	return strings.Join(parts, " ")
 }

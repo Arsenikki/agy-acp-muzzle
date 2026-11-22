@@ -112,6 +112,7 @@ A single run can then be locked with `paseo run --env AGY_LOCKDOWN=1 …`.
 | `--turn-timeout` | `AGY_ACP_MUZZLE_TURN_TIMEOUT` | `10m` | fail a turn after this long without kernel output |
 | `--turn-guard` | | on | fail kernel-error and empty turns |
 | `--disabled-tools` | `AGY_ACP_MUZZLE_DISABLED_TOOLS` | `run_workflow` | built-ins removed from open sessions |
+| `--flat-models` | | off | pass the kernel's flat per-thinking-level model list (default: one model per family plus a thinking-level option, like Claude in Paseo) |
 | `--no-cache` | | off | always start the kernel for probes |
 | `--sandbox-exec`, `--sandbox-ro`, `--sandbox-rw`, `--sandbox-port` | | | extend the locked Landlock rules |
 | `--no-sandbox` | | off | locked mode without Landlock (debugging only) |
