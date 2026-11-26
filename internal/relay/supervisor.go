@@ -53,6 +53,9 @@ type Supervisor struct {
 	// for that long (zero disables). See turns.go.
 	TurnGuard   bool
 	TurnTimeout time.Duration
+	// AutoContinue is how often a turn the kernel's harness crashed in is
+	// continued before the crash reaches the client (zero disables).
+	AutoContinue int
 
 	// HideModelVariants drops the kernel's flat per-thinking-level model list
 	// from results, leaving one model per family plus the thinking_level option
@@ -326,8 +329,9 @@ func (s *Supervisor) fromKernel(line []byte) error {
 		}
 		var drop bool
 		if line, drop = s.finishTurn(env, line); drop {
-			return nil // already failed by the watchdog
+			return nil // already answered, or continued
 		}
+		id = string(env.ID) // a continuation's answer names the client's prompt
 		method := s.inflightClient[id]
 		delete(s.inflightClient, id)
 		if method == "initialize" && len(env.Result) > 0 && s.Cache != nil {

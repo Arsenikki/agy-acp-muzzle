@@ -19,6 +19,11 @@ type fakeKernels struct {
 	stopped   int
 	received  [][]map[string]any // per kernel instance, the messages received
 	initDelay time.Duration      // delay before answering initialize (a slow kernel start)
+	// continueCrashes is how many continuation prompts crash the harness
+	// again after a "harness-crash" prompt did.
+	continueCrashes int
+	continueHang    bool // continuation prompts wait for session/cancel
+	continueEmpty   bool // continuation prompts end without output
 }
 
 func (f *fakeKernels) start() (*Process, error) {
@@ -91,6 +96,38 @@ func (f *fakeKernels) start() (*Process, error) {
 					continue
 				}
 				switch promptText(m) {
+				case "harness-crash", continuePrompt:
+					f.mu.Lock()
+					if promptText(m) == continuePrompt && f.continueHang {
+						f.mu.Unlock()
+						slowID = id
+						continue
+					}
+					crash := promptText(m) == "harness-crash" || f.continueCrashes > 0
+					if crash && promptText(m) == continuePrompt {
+						f.continueCrashes--
+					}
+					empty := f.continueEmpty
+					f.mu.Unlock()
+					switch {
+					case !crash && empty:
+					case !crash:
+						update("continued")
+					default:
+						update("Agent execution error: Harness process exited unexpectedly (WS close code 1011).")
+					}
+					reply(map[string]any{"stopReason": "end_turn"})
+				case "quoted-error":
+					update("Agent execution error: Harness process exited unexpectedly, as the log said")
+					send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
+						"sessionId": "s1", "update": map[string]any{"sessionUpdate": "tool_call", "toolCallId": "t1"},
+					}})
+					update("fixed it")
+					reply(map[string]any{"stopReason": "end_turn"})
+				case "late-error":
+					update("working on it")
+					update("Agent execution error: model output error: boom")
+					reply(map[string]any{"stopReason": "end_turn"})
 				case "kernel-error":
 					update("Agent execution error: model output error: boom")
 					reply(map[string]any{"stopReason": "end_turn"})
@@ -643,6 +680,8 @@ func TestTurnGuard(t *testing.T) {
 	}{
 		{"hello", true, false},
 		{"kernel-error", true, true},
+		{"late-error", true, true},
+		{"quoted-error", true, false},
 		{"empty", true, true},
 		{"kernel-error", false, false},
 		{"empty", false, false},
@@ -662,6 +701,87 @@ func TestTurnGuard(t *testing.T) {
 				t.Fatalf("error code: %v", r)
 			}
 		})
+	}
+}
+
+func TestAutoContinueAfterHarnessCrash(t *testing.T) {
+	cases := []struct {
+		name            string
+		autoContinue    int
+		continueCrashes int
+		wantPrompts     int
+		wantFail        bool
+		continueEmpty   bool // the continuation ends without output
+	}{
+		{"recovers", 2, 0, 2, false, false},
+		{"continuation with nothing left to say", 2, 0, 2, false, true},
+		{"recovers on the last attempt", 2, 1, 3, false, false},
+		{"gives up", 2, 5, 3, true, false},
+		{"disabled", 0, 0, 1, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeKernels{continueCrashes: tc.continueCrashes, continueEmpty: tc.continueEmpty}
+			c := runWith(t, f, func(s *Supervisor) { s.TurnGuard = true; s.AutoContinue = tc.autoContinue })
+			openSession(c)
+			c.send(prompt(3, "harness-crash"))
+			r, notes := c.response(3)
+			if failed := r["error"] != nil; failed != tc.wantFail {
+				t.Fatalf("failed=%v, want %v: %v", failed, tc.wantFail, r)
+			}
+			var prompts []string
+			f.mu.Lock()
+			for _, m := range f.received[0] {
+				if m["method"] == "session/prompt" {
+					prompts = append(prompts, promptText(m))
+				}
+			}
+			f.mu.Unlock()
+			if len(prompts) != tc.wantPrompts {
+				t.Fatalf("kernel got %d prompts, want %d: %q", len(prompts), tc.wantPrompts, prompts)
+			}
+			var text strings.Builder
+			for _, n := range notes {
+				b, _ := json.Marshal(n)
+				text.Write(b)
+			}
+			if tc.wantPrompts > 1 && !strings.Contains(text.String(), "continuing (1/2)") {
+				t.Fatalf("client not told about the continuation: %s", text.String())
+			}
+			if !tc.wantFail && !tc.continueEmpty && !strings.Contains(text.String(), "continued") {
+				t.Fatalf("continuation output missing: %s", text.String())
+			}
+			// The connection is still usable.
+			c.send(prompt(4, "hello"))
+			if r, _ := c.response(4); r["result"] == nil {
+				t.Fatalf("next prompt: %v", r)
+			}
+		})
+	}
+}
+
+func TestCancelDuringContinuation(t *testing.T) {
+	f := &fakeKernels{continueHang: true}
+	c := runWith(t, f, func(s *Supervisor) { s.TurnGuard = true; s.AutoContinue = 2 })
+	openSession(c)
+	c.send(prompt(3, "harness-crash"))
+	waitFor(t, func() bool { return len(f.methods(0)) == 4 }) // the continuation reached the kernel
+	c.send(`{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s1"}}`)
+	r, _ := c.response(3)
+	if res, _ := r["result"].(map[string]any); res["stopReason"] != "cancelled" {
+		t.Fatalf("cancel: %v", r)
+	}
+	// The kernel's late answer to the continuation is dropped; the next
+	// prompt goes once it arrived.
+	c.send(prompt(4, "hello"))
+	r, _ = c.response(4)
+	if r["result"] == nil {
+		t.Fatalf("next prompt: %v", r)
+	}
+	select {
+	case line := <-c.out:
+		t.Fatalf("unexpected output after the turn: %s", line)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
