@@ -57,14 +57,14 @@ func (s *Supervisor) readClient(line []byte) {
 // starts draining the session. Held prompts count as open: from the client's
 // view they are the active turn.
 func (s *Supervisor) cancelTurns(session string) {
-	for id, t := range s.turns {
+	for _, t := range s.turns {
 		if t.session != session || t.answered {
 			continue
 		}
 		t.answered = true
-		delete(s.inflightClient, id)
+		delete(s.inflightClient, t.client)
 		s.draining[session] = time.Now()
-		_ = s.replyCancelled(json.RawMessage(id))
+		_ = s.replyCancelled(json.RawMessage(t.client))
 	}
 	for _, line := range s.held[session] {
 		if env, err := acp.Parse(line); err == nil {

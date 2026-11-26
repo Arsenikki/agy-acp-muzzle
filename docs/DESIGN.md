@@ -199,6 +199,19 @@ Run with `cmd/acp-smoke` through the muzzle, in a container on Linux 6.18
   `--turn-guard` (default on) turns those, and turns with no output at all,
   into JSON-RPC errors (`-32003`). Measured: a locked hostile prompt's turn
   now fails visibly, and the next prompt in the session works.
+  The error text is caught even after other text of the turn.
+- **Harness crashes:** mid-turn the kernel's harness process can die
+  ("Agent execution error: Harness process exited unexpectedly (WS close
+  code 1011)", seen during a long web search). `--auto-continue` (default 2)
+  then keeps the client's prompt open, streams a short notice, and sends the
+  session a "continue where you left off" prompt (ids
+  `agy-acp-muzzle-cont-N`); its answer ends the client's prompt. Continuing
+  rather than re-sending the prompt avoids repeating completed steps. Past
+  the limit the crash fails the turn as above. The kernel itself doesn't
+  recover in the crashed turn (the crash surfaces as
+  `AntigravityConnectionError`), but its next prompt hits the closed
+  websocket and rebuilds the agent from the persisted trajectory, keeping
+  the history (read from the kernel source; not yet seen live).
   `--turn-timeout` (default 10 min) fails and cancels a turn whose kernel
   is silent that long. It doesn't fire while the kernel waits on the client
   (e.g. a permission prompt).

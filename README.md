@@ -25,6 +25,8 @@ resource and reliability gaps fixed on the way.
   - denied actions, kernel errors reported as text, and empty turns become
     JSON-RPC errors instead of quiet successes;
   - a watchdog cancels turns whose kernel goes silent;
+  - a turn cut off by a crash of the kernel's harness is continued
+    automatically (twice by default) before it fails;
   - a kernel crash fails the request in flight, and the next request recovers.
 - **History that survives restarts:** `session/load` replays the
   conversation from the kernel's own store.
@@ -111,6 +113,7 @@ A single run can then be locked with `paseo run --env AGY_LOCKDOWN=1 …`.
 | `--idle-timeout` | `AGY_ACP_MUZZLE_IDLE_TIMEOUT` | `3m` | stop an idle kernel (`0` keeps it) |
 | `--turn-timeout` | `AGY_ACP_MUZZLE_TURN_TIMEOUT` | `10m` | fail a turn after this long without kernel output |
 | `--turn-guard` | | on | fail kernel-error and empty turns |
+| `--auto-continue` | `AGY_ACP_MUZZLE_AUTO_CONTINUE` | `2` | continue a turn the kernel's harness crashed in up to this many times (`0` disables) |
 | `--disabled-tools` | `AGY_ACP_MUZZLE_DISABLED_TOOLS` | `run_workflow` | built-ins removed from open sessions |
 | `--flat-models` | | off | pass the kernel's flat per-thinking-level model list (default: one model per family plus a thinking-level option, like Claude in Paseo) |
 | `--no-cache` | | off | always start the kernel for probes |
